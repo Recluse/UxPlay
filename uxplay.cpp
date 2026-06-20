@@ -226,8 +226,27 @@ static float previous_hls_position = 0.0f;
 
 /* logging */
 
+/* Forward every uxplay log line to the embedding host so it can detect
+ * connection markers ("Begin streaming", "Open connections: 0", ...).
+ * Declared here (before log()) because log() itself does the forwarding — that
+ * single point catches BOTH uxplay.cpp's own LOGD/LOGI (e.g. "Open connections")
+ * AND library messages (which arrive via log_callback -> LOGI -> log()). NULL in
+ * the standalone exe. Forwarded BEFORE the log-level filter so markers arrive
+ * even when debug logging is off. */
+typedef void (*airplay_log_forward_fn)(int level, const char *msg, void *user);
+static airplay_log_forward_fn g_log_forward = NULL;
+static void *g_log_forward_user = NULL;
+
 static void log(int level, const char* format, ...) {
     va_list vargs;
+    if (g_log_forward) {
+        char buf[512];
+        va_list v2;
+        va_start(v2, format);
+        vsnprintf(buf, sizeof(buf), format, v2);
+        va_end(v2);
+        g_log_forward(level, buf, g_log_forward_user);
+    }
     if (level > log_level) return;
     switch (level) {
     case 0:
@@ -719,9 +738,13 @@ static void main_loop()  {
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
 
-#ifdef _WIN32
+    /* Publish the running loop on ALL platforms so airplay_request_shutdown()
+     * can g_main_loop_quit() it from the host thread. Was previously under
+     * "#ifdef _WIN32" only -> on macOS/Linux gmainloop stayed NULL and
+     * airplay_core_stop() hung joining a worker still inside g_main_loop_run().
+     * On Windows this is unchanged (was already set). */
     gmainloop = loop;
-#else 
+#ifndef _WIN32
     signal(SIGINT, SIG_DFL);
     signal(SIGTERM, SIG_DFL);
     signal(SIGHUP, SIG_DFL);
@@ -731,9 +754,8 @@ static void main_loop()  {
 #endif
     g_main_loop_run(loop);
 
-#ifdef _WIN32
-    gmainloop = NULL;
-#else
+    gmainloop = NULL;   /* clear on all platforms (was #ifdef _WIN32 only) */
+#ifndef _WIN32
     signal(SIGINT, CtrlHandler);  //switch back to non-mainloop CtrlHandler
     signal(SIGTERM, CtrlHandler);
     signal(SIGHUP, CtrlHandler);
@@ -2472,9 +2494,9 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     }
 }
 
-extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
+extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height, int rotation_hint) {
     if (use_video) {
-        video_renderer_size(width_source, height_source, width, height);
+        video_renderer_size(width_source, height_source, width, height, rotation_hint);
     }
 }
 
@@ -2662,7 +2684,15 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
     }
 }
 
+/* Setter for the host log-forward (the typedef + globals are declared up by
+ * log(), which is the single forwarding point — see there). */
+extern "C" void airplay_set_log_forward (airplay_log_forward_fn fn, void *user) {
+    g_log_forward = fn;
+    g_log_forward_user = user;
+}
+
 extern "C" void log_callback (void *cls, int level, const char *msg) {
+    /* No forward here: library messages reach the host via LOGx -> log(). */
     switch (level) {
     case LOGGER_DEBUG:
         LOGD("%s", msg);
@@ -2860,21 +2890,12 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
     }
 }
 
-#ifdef GST_MACOS
-/* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
-#include <TargetConditionals.h>
-#include <gst/gstmacos.h>
-void real_main (int argc, char *argv[]);
-
-int main (int argc, char *argv[]) {
-    LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
-    return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
-}
-
-void real_main (int argc, char *argv[]) {
-#else
-int main (int argc, char *argv[]) {
-#endif
+/* The former body of main() is now a reusable C-ABI entry point.  It is driven
+ * either by the standalone uxplay.exe main() (defined right after this function)
+ * or by the uxplay-core shared library's worker thread (lib/airplay_core.cpp).
+ * All the file-static option/runtime globals are kept as-is: the engine is
+ * single-instance by design. */
+extern "C" int airplay_run_blocking (int argc, char *argv[]) {
     std::vector<char> server_hw_addr;
     std::string config_file = "";
 
@@ -3198,10 +3219,12 @@ int main (int argc, char *argv[]) {
 
     if (start_dnssd(server_hw_addr, server_name)) {
         cleanup();
+        return 1;   /* cleanup() returns in library mode */
     }
     if (start_raop_server(display, tcp, udp, debug_log)) {
         stop_dnssd();
         cleanup();
+        return 1;
     }
 
     if (lang.length() > 1) {
@@ -3226,6 +3249,7 @@ int main (int argc, char *argv[]) {
         stop_raop_server();
         stop_dnssd();
         cleanup();
+        return 1;
     }
     reconnect:
     compression_type = 0;
@@ -3238,7 +3262,16 @@ int main (int argc, char *argv[]) {
         if (use_audio) {
             audio_renderer_stop();
         }
+        /* On macOS ALWAYS re-init the video pipeline on reconnect.  Reusing the
+         * post-disconnect pipeline leaves a shown-but-blank window (no frames
+         * render after a few cycles) and previously tripped the renderer-listen
+         * assert. A fresh pipeline per reconnect renders reliably.  Other
+         * platforms keep the original (reuse-when-possible) behaviour. */
+#ifdef __APPLE__
+        if (use_video) {
+#else
         if (use_video && (close_window || preserve_connections || full_video_reset)) {
+#endif
             video_renderer_destroy();
             if (!preserve_connections) {
                 url.erase();
@@ -3267,8 +3300,55 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
     }
     cleanup();
+    return 0;
 }
- 
+
+/* Request a clean shutdown from another thread (the embedding host).
+ * gmainloop and relaunch_video are file-statics in this TU, so the shim lives
+ * here.  Mirrors the handle_signal() path: drop the reconnect loop, then quit
+ * the running GMainLoop so airplay_run_blocking() returns. */
+extern "C" void airplay_request_shutdown (void) {
+    relaunch_video = false;
+    if (gmainloop) {
+        g_main_loop_quit(gmainloop);
+    }
+}
+
+/* Host HWND for the renderer, set before airplay_run_blocking() by the
+ * embedding host.  renderers/video_renderer.c reads it via
+ * airplay_get_host_window() in its GstVideoOverlay block, instead of the
+ * UXPLAY_OVERLAY_HWND env var (which remains as a fallback for the exe). */
+static void *g_host_window_handle = NULL;
+extern "C" void airplay_set_host_window (void *hwnd) {
+    g_host_window_handle = hwnd;
+}
+extern "C" void *airplay_get_host_window (void) {
+    return g_host_window_handle;
+}
+
+/* When embedded as the uxplay-core shared library, cleanup() must NOT exit()
+ * the host process — it returns so the engine can be stopped and started again
+ * in the same process.  The standalone exe leaves this false (cleanup exits as
+ * before). */
+static bool library_mode = false;
+extern "C" void airplay_set_library_mode (int on) {
+    library_mode = (on != 0);
+}
+
+#ifdef GST_MACOS
+/* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
+#include <TargetConditionals.h>
+#include <gst/gstmacos.h>
+int main (int argc, char *argv[]) {
+    LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
+    return gst_macos_main ((GstMainFunc) airplay_run_blocking, argc, argv, NULL);
+}
+#else
+int main (int argc, char *argv[]) {
+    return airplay_run_blocking (argc, argv);
+}
+#endif
+
 static void cleanup() {
     if (use_audio) {
         audio_renderer_destroy();
@@ -3307,5 +3387,11 @@ static void cleanup() {
         dbus_connection_unref(dbus_connection);
     }
 #endif
+    /* In library mode, return instead of killing the process so the engine can
+     * be restarted; error-path callers in airplay_run_blocking follow their
+     * cleanup() with `return 1` so they don't fall through. */
+    if (library_mode) {
+        return;
+    }
     exit(0);
 }

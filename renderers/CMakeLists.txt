@@ -77,9 +77,30 @@ if( GST_LIBRARY_DIRS MATCHES "/Library/FrameWorks/GStreamer.framework/lib" )
   endif()
   target_link_directories ( renderers  PUBLIC ${GST_LIBRARY_DIRS} )  
 elseif( CMAKE_VERSION VERSION_LESS "3.12" )
-  target_link_libraries ( renderers  PUBLIC ${GST_LIBRARIES} )  
-else()		  
+  target_link_libraries ( renderers  PUBLIC ${GST_LIBRARIES} )
+else()
   target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
+endif()
+
+if( APPLE )
+  # The macOS overlay/layer bind in video_renderer.c calls objc_msgSend /
+  # sel_registerName (NSView setWantsLayer:/setLayer:) and CoreGraphics (CGColor
+  # for the CALayer background), so the renderers lib -- and anything linking it
+  # (uxplay-core.dylib) -- needs libobjc + the CoreGraphics framework.
+  #
+  # The custom video sink avsample_sink.m (our own AVSampleBufferDisplayLayer,
+  # fed NV12 from an appsink) is Objective-C and needs the
+  # AV/CoreMedia/CoreVideo/QuartzCore + AppKit frameworks.
+  enable_language( OBJC )
+  target_sources( renderers PRIVATE avsample_sink.m )
+  target_link_libraries( renderers PUBLIC objc
+                         "-framework CoreGraphics"
+                         "-framework Foundation"
+                         "-framework AppKit"
+                         "-framework QuartzCore"
+                         "-framework CoreVideo"
+                         "-framework CoreMedia"
+                         "-framework AVFoundation" )
 endif()
 
 

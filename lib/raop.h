@@ -94,7 +94,7 @@ struct raop_callbacks_s {
     void  (*audio_remote_control_id)(void *cls, const char *dacp_id, const char *active_remote_header);
     void  (*audio_set_progress)(void *cls, uint32_t *start, uint32_t *curr, uint32_t *end);
     void  (*audio_get_format)(void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat);
-    void  (*video_report_size)(void *cls, float *width_source, float *height_source, float *width, float *height);
+    void  (*video_report_size)(void *cls, float *width_source, float *height_source, float *width, float *height, int rotation_hint); /* rotation_hint = packet[5] of codec packet, encodes iPhone orientation */
     void  (*mirror_video_running)(void *cls, bool is_running);
     void  (*report_client_request) (void *cls, char *deviceid, char *model, char *name, bool *admit);
     void  (*display_pin) (void *cls, char * pin);

@@ -607,8 +607,19 @@ raop_rtp_mirror_thread(void *arg)
                            " %f != width_source = %f, height_source = %f", width_0, height_0, width_source, height_source);
                 }
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror: unidentified extra header data  %f, %f", unknown_w, unknown_h);
+
+                /* Emit the final display dimensions at INFO so an embedding host can
+                 * read them (for window aspect-fit) without enabling debug logging. */
+                logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                           "display dimensions: w=%d h=%d", (int) width, (int) height);
                 if (raop_rtp_mirror->callbacks.video_report_size) {
-                    raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, &width_source, &height_source, &width, &height);
+                    /* packet[5] is the upper byte of the masked-off payload_type short;
+                     * the iPhone uses it to encode orientation, so pass it on as a
+                     * rotation hint:
+                     *   0x00 = portrait, 0x04 = landscape-right, 0x07 = landscape-left
+                     * 0x05/0x06 are treated as upside-down variants. */
+                    int rotation_hint = (int) packet[5];
+                    raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, &width_source, &height_source, &width, &height, rotation_hint);
                 }
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror width_source = %f height_source = %f width = %f height = %f",
                            width_source, height_source, width, height);

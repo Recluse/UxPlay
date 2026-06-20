@@ -20,9 +20,57 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
+#include <stdio.h>      /* snprintf for rotation caps */
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/video/videooverlay.h>  /* GstVideoOverlay HWND */
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>        /* marshal NSView overlay bind to the main thread */
+#include <objc/objc.h>                /* BOOL / YES */
+#include <objc/message.h>            /* objc_msgSend */
+#include <objc/runtime.h>            /* sel_registerName */
+#include <CoreGraphics/CoreGraphics.h> /* CGRect for the CALayer sublayer frame */
+#endif
 #include "video_renderer.h"
+
+/* Host-provided renderer HWND, defined in uxplay.cpp.  When the embedding host
+ * has set one, we render into it via GstVideoOverlay instead of the
+ * UXPLAY_OVERLAY_HWND env var.  Returns NULL for the standalone exe. */
+extern void *airplay_get_host_window (void);
+
+#ifdef __APPLE__
+/* Custom macOS sink — render decoded NV12 frames into our own
+ * AVSampleBufferDisplayLayer (avsample_sink.m), bypassing GStreamer's buggy
+ * applemedia sinks (avsamplebufferlayersink UAF on caps-change, osxvideosink
+ * teardown deadlock).  Selected by videosink == "avlayer": the launch uses an
+ * appsink, and this callback pumps each NV12 frame to the layer. */
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
+extern void *avlayer_sink_create(void *nsview);
+extern void  avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long ys,
+                                        const unsigned char *uv, unsigned long uvs, int w, int h);
+extern void  avlayer_sink_destroy(void *sink);
+
+static GstFlowReturn avlayer_on_new_sample(GstAppSink *appsink, gpointer user_data) {
+    GstSample *sample = gst_app_sink_pull_sample(appsink);
+    if (!sample) return GST_FLOW_OK;
+    GstBuffer *buf = gst_sample_get_buffer(sample);
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstVideoInfo info;
+    if (buf && caps && gst_video_info_from_caps(&info, caps)) {
+        GstVideoFrame frame;
+        if (gst_video_frame_map(&frame, &info, buf, GST_MAP_READ)) {
+            avlayer_sink_enqueue_nv12(user_data,
+                GST_VIDEO_FRAME_PLANE_DATA(&frame, 0), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0),
+                GST_VIDEO_FRAME_PLANE_DATA(&frame, 1), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 1),
+                GST_VIDEO_FRAME_WIDTH(&frame), GST_VIDEO_FRAME_HEIGHT(&frame));
+            gst_video_frame_unmap(&frame);
+        }
+    }
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+#endif
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
@@ -36,9 +84,10 @@ static unsigned char X11_search_attempts = 0;
 
 static GstClockTime gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
 static logger_t *logger = NULL;
-static unsigned short width, height, width_source, height_source;  /* not currently used */
+static unsigned short width, height, width_source, height_source;  /* now used to push caps on rotation */
+static int last_rotation_hint = -1;  /* track packet[5] separately -- both landscapes have same dims */
 static bool first_packet = false;
-static bool sync = false;
+static bool vsync_prop = false;  /* renamed from "sync" -- it collided with libc sync() pulled in by <dispatch/dispatch.h> on macOS */
 static bool auto_videosink = true;
 static bool hls_video = false;
 #ifdef X_DISPLAY_FIX
@@ -78,6 +127,7 @@ typedef enum {
 
 struct video_renderer_s {
     GstElement *appsrc, *pipeline, *textsrc;
+    GstElement *rotator; /* dynamic videoflip for iPhone rotation tracking */
     GstBus *bus;
     const char *codec;
     bool autovideo;
@@ -86,6 +136,9 @@ struct video_renderer_s {
     gboolean eos;
     gint64 duration;
     gint buffering_level;
+#ifdef __APPLE__
+    void *avlayer; /* custom AVSampleBufferDisplayLayer sink handle */
+#endif
 #ifdef  X_DISPLAY_FIX
     bool use_x11;
     const char * server_name;
@@ -172,12 +225,53 @@ static const char jpeg_caps[]="image/jpeg";
 static const char h264_caps[]="video/x-h264,stream-format=(string)byte-stream,alignment=(string)au";
 static const char h265_caps[]="video/x-h265,stream-format=(string)byte-stream,alignment=(string)au";
 
-void video_renderer_size(float *f_width_source, float *f_height_source, float *f_width, float *f_height) {
+void video_renderer_size(float *f_width_source, float *f_height_source, float *f_width, float *f_height, int rotation_hint) {
+    unsigned short new_w = (unsigned short) *f_width;
+    unsigned short new_h = (unsigned short) *f_height;
+    bool dims_changed = (new_w != width) || (new_h != height);
+    bool rot_changed = (rotation_hint != last_rotation_hint);
     width_source = (unsigned short) *f_width_source;
     height_source = (unsigned short) *f_height_source;
-    width = (unsigned short) *f_width;
-    height = (unsigned short) *f_height;
-    logger_log(logger, LOGGER_DEBUG, "begin video stream wxh = %dx%d; source %dx%d", width, height, width_source, height_source);
+    width = new_w;
+    height = new_h;
+    last_rotation_hint = rotation_hint;
+    /* Log at INFO (not DEBUG) so the embedding host can read the video size for
+     * window aspect-fit without enabling debug logging (debug floods the host
+     * log callback with per-frame DEBUG lines -> latency). This fires only per
+     * stream-start / rotation, not per-frame. */
+    logger_log(logger, LOGGER_INFO, "begin video stream wxh = %dx%d; source %dx%d (rot=0x%02x)",
+               width, height, width_source, height_source, rotation_hint);
+
+    /* Both landscape-right (0x04) and landscape-left (0x07) report the SAME
+     * width/height in the codec packet (e.g. 1920x884 either way), so a
+     * dimensions-only gate misses direct landscape<->landscape rotations and
+     * leaves the picture upside-down.  Also fire when packet[5] changed.
+     *
+     * packet[5] orientation encoding:
+     *   0x00 -> portrait (right-side-up)
+     *   0x04 -> landscape rotated 90 degrees clockwise  (camera/volume buttons up)
+     *   0x07 -> landscape rotated 90 degrees counter-clockwise (camera/volume buttons down)
+     *   0x05 / 0x06 -> upside-down variants, mapped to 180 degrees */
+    if ((dims_changed || rot_changed) && renderer && renderer->rotator) {
+        int method;
+        const char *label;
+        switch (rotation_hint) {
+            case 0x00: method = 0 /* IDENTITY */;        label = "portrait";          break;
+            case 0x04: method = 1 /* 90R  */;            label = "landscape-right";   break;
+            case 0x07: method = 3 /* 90L  */;            label = "landscape-left";    break;
+            case 0x05: method = 2 /* 180  */;            label = "upside-down";       break;
+            case 0x06: method = 2 /* 180  */;            label = "upside-down";       break;
+            default:
+                /* fall back to aspect heuristic, default to 90R for unknown landscape */
+                method = (width > height) ? 1 : 0;
+                label = "unknown rotation -- aspect fallback";
+                break;
+        }
+        g_object_set(renderer->rotator, "video-direction", method, NULL);
+        logger_log(logger, LOGGER_INFO,
+                   "video_renderer_size: %ux%u rot=0x%02x -> videoflip method=%d (%s)",
+                   (unsigned) width, (unsigned) height, rotation_hint, method, label);
+    }
 }
 
 GstElement *make_video_sink(const char *videosink, const char *videosink_options) {
@@ -311,9 +405,20 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             }
             gint flags = 0;
             g_object_get(renderer_type[i]->pipeline, "flags", &flags, NULL);
-            flags |= GST_PLAY_FLAG_DOWNLOAD;
-            flags |= GST_PLAY_FLAG_BUFFERING;    // set by default in playbin3, but not in playbin2; is it needed?
+            /* For AirPlay HLS the source is the iPhone on the LAN.  Disable
+             * DOWNLOAD (no disk cache, adds IO latency) and BUFFERING (preroll
+             * wait).  Combined with buffer-duration=0, buffer-size=0, this
+             * minimizes startup latency and live-edge delay. */
+            flags &= ~GST_PLAY_FLAG_DOWNLOAD;
+            flags &= ~GST_PLAY_FLAG_BUFFERING;
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
+            g_object_set(renderer_type[i]->pipeline,
+                         "buffer-duration", (gint64) 0,
+                         "buffer-size",     (gint)  0,
+                         NULL);
+            logger_log(logger, LOGGER_INFO,
+                       "playbin%u configured for low-latency HLS: flags=0x%x buffer-duration=0 buffer-size=0",
+                       playbin_version, flags);
             //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
         } else {
             bool jpeg_pipeline = false;
@@ -334,6 +439,9 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             if (jpeg_pipeline) {
                 g_string_append(launch, "jpegdec ");
             } else {
+                /* A default queue is used here: a leaky=downstream
+                 * max-size-buffers=1 queue combined with sink-side qos=TRUE
+                 * dropped all frames (the window was never created). */
                 g_string_append(launch, "queue ! ");
                 g_string_append(launch, parser);
                 g_string_append(launch, " ! ");
@@ -347,12 +455,31 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             if (!rtp || jpeg_pipeline) {
                 g_string_append(launch, " ! ");
                 append_videoflip(launch, &videoflip[0], &videoflip[1]);
+                /* Always-on videoflip "rotator" so we can flip frames as the
+                 * iPhone rotates -- mirror frames are always sent in native portrait
+                 * orientation, the receiver is expected to rotate them per the codec
+                 * packet's logical width/height. */
+                if (!jpeg_pipeline) {
+                    g_string_append(launch, "videoflip name=rotator video-direction=identity ! ");
+                }
                 g_string_append(launch, converter);
                 g_string_append(launch, " ! ");
                 g_string_append(launch, "videoscale ! ");
                 if (jpeg_pipeline) {
                     g_string_append(launch, " imagefreeze allow-replace=TRUE ! textoverlay name=metadata_overlay ! ");
                 }
+#ifdef __APPLE__
+                /* "avlayer" -> custom AVSampleBufferDisplayLayer sink.
+                 * We force NV12 into an appsink and pump frames to our own layer
+                 * (see avlayer_on_new_sample / avsample_sink.m).  drop=true +
+                 * max-buffers keep latency flat; sync=false renders ASAP. */
+                if (!strcmp(videosink, "avlayer") && !jpeg_pipeline) {
+                    g_string_append(launch, "videoconvert ! video/x-raw,format=NV12 ! appsink name=avlayer_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    g_string_append(launch, " emit-signals=false sync=false max-buffers=3 drop=true");
+                    vsync_prop = false;
+                } else {
+#endif
                 g_string_append(launch, videosink);
                 g_string_append(launch, " name=");
                 g_string_append(launch, videosink);
@@ -361,11 +488,14 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                 g_string_append(launch, videosink_options);
                 if (video_sync && !jpeg_pipeline) {
                     g_string_append(launch, " sync=true");
-                    sync = true;
+                    vsync_prop = true;
                 } else {
                     g_string_append(launch, " sync=false");
-                    sync = false;
+                    vsync_prop = false;
                 }
+#ifdef __APPLE__
+                }
+#endif
             }
             if (!strcmp(renderer_type[i]->codec, h264)) {
                 char *pos = launch->str;
@@ -399,7 +529,159 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
             renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "video_source");
             g_assert(renderer_type[i]->appsrc);
+            /* Do NOT set do-timestamp=TRUE -- uxplay sets PTS manually from the
+             * iPhone's NTP timestamp; appsrc auto-timestamping would overwrite
+             * those, and the sink would then mark everything "late" via qos and
+             * drop all frames (which made the window never appear). */
             g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+            /* Grab the rotator videoflip if it was inserted (h264/h265 pipelines) */
+            renderer_type[i]->rotator = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "rotator");
+
+            /* Overlay HWND: if the launcher passed UXPLAY_OVERLAY_HWND in the
+             * environment, the videosink is asked to render into that
+             * pre-existing HWND via GstVideoOverlay rather than create its own
+             * window.  Lets the launcher own the WndProc and do native
+             * borderless / drag / resize / fullscreen / aspect. */
+            {
+                /* Prefer the in-process host HWND set by the embedding host;
+                 * fall back to UXPLAY_OVERLAY_HWND env for the exe. */
+                void *host_hwnd = airplay_get_host_window();
+                const char *hwnd_env = g_getenv("UXPLAY_OVERLAY_HWND");
+                guintptr hwnd = 0;
+                if (host_hwnd) {
+                    hwnd = (guintptr) host_hwnd;
+                } else if (hwnd_env && *hwnd_env) {
+                    /* Accept both decimal and 0x-prefixed hex. */
+                    hwnd = (guintptr) g_ascii_strtoull(hwnd_env, NULL,
+                                                       (hwnd_env[0] == '0' && (hwnd_env[1] == 'x' || hwnd_env[1] == 'X')) ? 16 : 10);
+                }
+                if (hwnd) {
+                    /* Videosink element was named "<videosink>_<codec>"
+                     * in the launch string above (line 418-421). */
+                    char sink_name[64];
+                    g_snprintf(sink_name, sizeof(sink_name), "%s_%s",
+                               videosink, renderer_type[i]->codec);
+                    GstElement *sink = gst_bin_get_by_name(
+                        GST_BIN(renderer_type[i]->pipeline), sink_name);
+#ifdef __APPLE__
+                    /* macOS: two sink families need binding, both via AppKit
+                     * calls that MUST run on the main thread (this code runs on
+                     * the engine worker).  We marshal onto the main queue with
+                     * dispatch_sync (not async) so the bind completes BEFORE
+                     * PLAYING; no deadlock because the host's NSApplication run
+                     * loop is already running and draining the main queue (the
+                     * engine starts only after the loop is up).
+                     *   * CALayer sinks (avsamplebufferlayersink) expose a read-only
+                     *     "layer" CALayer -> attach it to our NSView; it auto-scales
+                     *     on window resize (no GL framebuffer realloc, which is what
+                     *     corrupted glimagesink on rotation).
+                     *   * GstVideoOverlay sinks (glimagesink) -> set_window_handle.
+                     * We do NOT call gst_video_overlay_handle_events(): on macOS the
+                     * host owns the window's events (unlike the Win32 child-HWND case). */
+                    if (sink) {
+                        if (!strcmp(videosink, "avlayer")) {
+                            /* Custom sink: create our own
+                             * AVSampleBufferDisplayLayer in the host NSView (the
+                             * .m marshals to the main thread itself) and pump the
+                             * appsink's NV12 frames to it.  No gst applemedia sink
+                             * => no UAF / no teardown deadlock; clean resize. */
+                            renderer_type[i]->avlayer = avlayer_sink_create((void *) hwnd);
+                            GstAppSinkCallbacks cbs;
+                            memset(&cbs, 0, sizeof(cbs));
+                            cbs.new_sample = avlayer_on_new_sample;
+                            gst_app_sink_set_callbacks(GST_APP_SINK(sink), &cbs,
+                                                       renderer_type[i]->avlayer, NULL);
+                            logger_log(logger, LOGGER_INFO,
+                                       "avlayer: bound appsink %s to host NSView 0x%" G_GINTPTR_MODIFIER "x%s",
+                                       sink_name, (guintptr) hwnd,
+                                       renderer_type[i]->avlayer ? "" : " (LAYER CREATE FAILED)");
+                        } else {
+                        gboolean has_layer =
+                            (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "layer") != NULL);
+                        if (has_layer || GST_IS_VIDEO_OVERLAY(sink)) {
+                            GstElement *sink_el = sink;
+                            guintptr ov_handle = hwnd;
+                            /* avsamplebufferlayersink's "layer" is NULL until the sink
+                             * is realized; bring it to READY on this worker thread so
+                             * the AVSampleBufferDisplayLayer exists before we attach. */
+                            gpointer av_layer = NULL;
+                            if (has_layer) {
+                                gst_element_set_state(sink_el, GST_STATE_READY);
+                                gst_element_get_state(sink_el, NULL, NULL, GST_SECOND);
+                                g_object_get(sink_el, "layer", &av_layer, NULL);
+                            }
+                            dispatch_sync(dispatch_get_main_queue(), ^{
+                                id view = (id) ov_handle;
+                                if (has_layer) {
+                                    /* CALayer sink (avsamplebufferlayersink): add the
+                                     * sink's CALayer as a SUBLAYER of a layer-BACKED
+                                     * view (AppKit owns + sizes the backing layer). */
+                                    gpointer layer = av_layer;
+                                    ((void (*)(id, SEL, BOOL)) objc_msgSend)(
+                                        view, sel_registerName("setWantsLayer:"), YES);
+                                    id backing = ((id (*)(id, SEL)) objc_msgSend)(
+                                        view, sel_registerName("layer"));
+                                    CGRect b = ((CGRect (*)(id, SEL)) objc_msgSend)(
+                                        view, sel_registerName("bounds"));
+                                    /* Black backing so any aspect letterbox area is
+                                     * black (standard video look), not the desktop. */
+                                    CGColorRef bg = CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0);
+                                    ((void (*)(id, SEL, CGColorRef)) objc_msgSend)(
+                                        backing, sel_registerName("setBackgroundColor:"), bg);
+                                    if (layer) {
+                                        ((void (*)(id, SEL, CGRect)) objc_msgSend)(
+                                            (id) layer, sel_registerName("setFrame:"), b);
+                                        /* kCALayerWidthSizable(2) | kCALayerHeightSizable(16) */
+                                        ((void (*)(id, SEL, unsigned int)) objc_msgSend)(
+                                            (id) layer, sel_registerName("setAutoresizingMask:"), 18u);
+                                        ((void (*)(id, SEL, id)) objc_msgSend)(
+                                            backing, sel_registerName("addSublayer:"), (id) layer);
+                                    }
+                                } else {
+                                    ((void (*)(id, SEL, BOOL)) objc_msgSend)(
+                                        view, sel_registerName("setWantsLayer:"), YES);
+                                    gst_video_overlay_set_window_handle(
+                                        GST_VIDEO_OVERLAY(sink_el), ov_handle);
+                                }
+                            });
+                            logger_log(logger, LOGGER_INFO,
+                                       "overlay: bound videosink %s to host NSView 0x%" G_GINTPTR_MODIFIER "x (%s)",
+                                       sink_name, (guintptr) hwnd, has_layer ? "CALayer" : "overlay");
+                        } else {
+                            logger_log(logger, LOGGER_ERR,
+                                       "overlay: %s has neither a layer nor GstVideoOverlay", sink_name);
+                        }
+                        } /* end: not the "avlayer" custom sink */
+                    } else {
+                        logger_log(logger, LOGGER_ERR, "overlay: %s element missing", sink_name);
+                    }
+#else
+                    if (sink && GST_IS_VIDEO_OVERLAY(sink)) {
+                        gst_video_overlay_set_window_handle(
+                            GST_VIDEO_OVERLAY(sink), hwnd);
+                        /* Enable event handling so the sink forwards the
+                         * GSTD3D11 child window's mouse messages to our HWND
+                         * (cross-thread SendMessage -> our WndProc).  Without
+                         * this the host can't see clicks over the video. */
+                        gst_video_overlay_handle_events(GST_VIDEO_OVERLAY(sink), TRUE);
+                        logger_log(logger, LOGGER_INFO,
+                                   "overlay: bound videosink %s to host HWND 0x%" G_GINTPTR_MODIFIER "x (%s)",
+                                   sink_name, (guintptr) hwnd,
+                                   host_hwnd ? "in-process host" : "UXPLAY_OVERLAY_HWND env");
+                    } else {
+                        logger_log(logger, LOGGER_ERR,
+                                   "overlay: %s element missing or no GstVideoOverlay support",
+                                   sink_name);
+                    }
+#endif
+                    if (sink) gst_object_unref(sink);
+                } else if (hwnd_env && *hwnd_env) {
+                    logger_log(logger, LOGGER_ERR,
+                               "overlay: UXPLAY_OVERLAY_HWND='%s' parsed to 0", hwnd_env);
+                }
+                /* else: no host HWND and no env -> sink creates its own window
+                 * (standalone exe default; also the NULL-hwnd case) */
+            }
             g_string_free(launch, TRUE);
             gst_caps_unref(caps);
             gst_object_unref(clock);
@@ -584,7 +866,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
     GstBuffer *buffer = NULL;
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
-    if (sync) {
+    if (vsync_prop) {
         if (pts >= gst_video_pipeline_base_time) {
             pts -= gst_video_pipeline_base_time;
         } else {
@@ -613,7 +895,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
         buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
         g_assert(buffer != NULL);
         //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
-        if (sync) {
+        if (vsync_prop) {
             GST_BUFFER_PTS(buffer) = pts;
         }
         gst_buffer_fill(buffer, 0, data, *data_len);
@@ -717,6 +999,14 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
         }	
         gst_object_unref(renderer->bus);
         gst_object_unref(renderer->pipeline);
+#ifdef __APPLE__
+        /* Tear down our AVSampleBufferDisplayLayer AFTER the pipeline is NULL, so
+         * no appsink new-sample callback can still be pumping frames into it. */
+        if (renderer->avlayer) {
+            avlayer_sink_destroy(renderer->avlayer);
+            renderer->avlayer = NULL;
+        }
+#endif
 #ifdef X_DISPLAY_FIX
         if (renderer->gst_window){
 	  // free_X11_Display(renderer->gst_window);   without this, a memory leak; with it, a coredump
@@ -1141,9 +1431,18 @@ void video_renderer_seek(float position) {
 
 unsigned int video_renderer_listen(void *loop, int id) {
     g_assert(id >= 0 && id < n_renderers);
-    g_assert (renderer_type[id] && renderer_type[id]->bus);
+    /* After a connection reaches PLAYING, video_renderer_start()
+     * destroys the UNUSED renderers and sets renderer_type[i] = NULL.  On a
+     * reconnect that does NOT re-init the renderers (e.g. -nc / no full reset),
+     * main_loop() still calls listen() for every slot 0..n_renderers, so the
+     * NULLed slots used to trip g_assert and abort the whole process (observed as
+     * a crash on the 2nd/3rd device disconnect on macOS).  Skip absent renderers
+     * instead: main_loop() already treats a 0 watch-id as "no watch". */
+    if (!renderer_type[id] || !renderer_type[id]->bus) {
+        return 0;
+    }
     return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,(GstBusFunc)
-                                            gstreamer_video_pipeline_bus_callback, (gpointer) loop);    
+                                            gstreamer_video_pipeline_bus_callback, (gpointer) loop);
 }
 
 bool video_renderer_eos_watch() {

@@ -65,6 +65,28 @@ if (DBUS_FOUND)
       target_link_libraries( uxplay ${DBUS_LIBRARY})
 endif()
 
+# uxplay-core — the engine as an embeddable shared library with a flat C ABI
+# (lib/airplay_core.h).  Additive; off by default so normal exe builds are
+# unchanged.  Enable with -DBUILD_CORE_DLL=ON.
+option( BUILD_CORE_DLL "Build uxplay-core shared library for in-process embedding" OFF )
+if ( BUILD_CORE_DLL )
+  message( STATUS "will build uxplay-core shared library" )
+  add_library( uxplay-core SHARED uxplay.cpp lib/airplay_core.cpp )
+  target_link_libraries( uxplay-core renderers airplay )
+  if (DBUS_FOUND)
+    target_link_libraries( uxplay-core ${DBUS_LIBRARY})
+  endif()
+  set_target_properties( uxplay-core PROPERTIES
+      OUTPUT_NAME   "uxplay-core"
+      PREFIX        ""          # -> uxplay-core.dll (no "lib" prefix)
+      IMPORT_PREFIX ""
+      IMPORT_SUFFIX ".dll.a" )  # -> uxplay-core.dll.a import library
+  install( TARGETS uxplay-core
+           RUNTIME DESTINATION bin
+           ARCHIVE DESTINATION lib )
+  install( FILES lib/airplay_core.h DESTINATION include )
+endif()
+
 install( TARGETS  uxplay RUNTIME DESTINATION bin )
 install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
 install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} ) 
