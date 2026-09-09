@@ -54,9 +54,9 @@ endif()
 find_package(PkgConfig REQUIRED)
 
 aux_source_directory(. play_src)
-# airplay_core.cpp is the uxplay-core shared library's glue TU only — keep it OUT
-# of the airplay static lib (otherwise it is also linked into uxplay.exe and
-# duplicated in the shared library).
+# Plan B: airplay_core.cpp is the uxplay-core DLL's glue TU only — keep it OUT of
+# the airplay static lib (otherwise it is also linked into uxplay.exe and
+# duplicated in the DLL).
 list(FILTER play_src EXCLUDE REGEX "airplay_core\\.cpp$")
 set(DIR_SRCS ${play_src})
 

@@ -152,6 +152,8 @@ struct dnssd_s {
     uint32_t features2;
 
     unsigned char pin_pw;
+
+    uint32_t interface_index;   /* 0 = kDNSServiceInterfaceIndexAny (advertise everywhere) */
 };
 
 
@@ -345,7 +347,7 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     strncat(servname, dnssd->name, sizeof(servname)-strlen(servname)-1);
 
     /* Register the service */
-    DNSServiceErrorType retval = dnssd->DNSServiceRegister(&dnssd->raop_service, 0, 0,
+    DNSServiceErrorType retval = dnssd->DNSServiceRegister(&dnssd->raop_service, 0, dnssd->interface_index,
                                                           servname, "_raop._tcp",
                                                           NULL, NULL,
                                                           htons(port),
@@ -398,7 +400,7 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "vv", strlen(AIRPLAY_VV), AIRPLAY_VV);
 
     /* Register the service */
-    DNSServiceErrorType retval = dnssd->DNSServiceRegister(&dnssd->airplay_service, 0, 0,
+    DNSServiceErrorType retval = dnssd->DNSServiceRegister(&dnssd->airplay_service, 0, dnssd->interface_index,
                                                            dnssd->name, "_airplay._tcp",
                                                            NULL, NULL,
                                                            htons(port),
@@ -487,6 +489,10 @@ uint64_t dnssd_get_airplay_features(dnssd_t *dnssd) {
 
 void dnssd_set_pk(dnssd_t *dnssd, char * pk_str) {
     dnssd->pk = pk_str;
+}
+
+void dnssd_set_interface_index(dnssd_t *dnssd, uint32_t interface_index) {
+    dnssd->interface_index = interface_index;
 }
 
 void dnssd_set_airplay_features(dnssd_t *dnssd, int bit, int val) {

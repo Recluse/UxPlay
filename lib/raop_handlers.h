@@ -221,11 +221,11 @@ raop_handler_info(raop_conn_t *conn,
     plist_t displays_0_height_node = plist_new_uint(raop->height);
     plist_t displays_0_width_pixels_node = plist_new_uint(raop->width);
     plist_t displays_0_height_pixels_node = plist_new_uint(raop->height);
-    plist_t displays_0_rotation_node = plist_new_bool(1); /* claim rotation support (was 0) */
+    plist_t displays_0_rotation_node = plist_new_bool(1); /* PATCH: claim rotation support (was 0) */
     plist_t displays_0_refresh_rate_node = plist_new_real((double) 1.0 / raop->refreshRate);  /* set as real 0.166666  = 60hz in AppleTV gen 3 */
     plist_t displays_0_max_fps_node = plist_new_uint(raop->maxFPS);
     plist_t displays_0_overscanned_node = plist_new_bool(raop->overscanned);
-    plist_t displays_0_features = plist_new_uint(14 | 256); /* add feature bit 8 (rotation) */
+    plist_t displays_0_features = plist_new_uint(14 | 256); /* PATCH: add feature bit 8 (rotation) */
 
     plist_dict_set_item(displays_0_node, "uuid", displays_0_uuid_node);
     plist_dict_set_item(displays_0_node, "widthPhysical", displays_0_width_physical_node);
@@ -1162,6 +1162,14 @@ raop_handler_set_parameter(raop_conn_t *conn,
         } else {
             logger_log(raop->logger, LOGGER_WARNING, "RAOP not initialized at SET_PARAMETER metadata");
         }
+    } else {
+        /* PATCH-DIAG: log unhandled SET_PARAMETER content so we can spot orientation/rotation events */
+        char preview[256] = {0};
+        int n = datalen < 200 ? datalen : 200;
+        if (data && n > 0) memcpy(preview, data, n);
+        for (int k = 0; k < n; ++k) if (preview[k] < 0x20 && preview[k] != '\n' && preview[k] != '\r') preview[k] = '.';
+        logger_log(raop->logger, LOGGER_INFO, "PATCH: unhandled SET_PARAMETER content-type=%s (%d bytes): %s",
+                   content_type, datalen, preview);
     }
 }
 
@@ -1278,14 +1286,18 @@ raop_handler_teardown(raop_conn_t *conn,
             }
         }
     } else if (teardown_110) {
+        /* PATCH (Plan B): JOIN the mirror RTP thread BEFORE video_reset() arms the
+         * reconnect — else the main-thread rebuild can race the still-live mirror
+         * thread writing renderer_type[] (UAF). raop_rtp_mirror_stop is self-contained
+         * (running=0 under run_mutex + JOIN) and does not depend on video_reset(). */
+        if (conn->raop_rtp_mirror) {
+        /* Stop our video RTP session */
+            raop_rtp_mirror_stop(conn->raop_rtp_mirror);
+        }
         if (raop->hls_pending) {
             raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_RTP_TO_HLS_TEARDOWN);
         } else {
             raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_RTP_SHUTDOWN);
-        }
-        if (conn->raop_rtp_mirror) {
-        /* Stop our video RTP session */
-            raop_rtp_mirror_stop(conn->raop_rtp_mirror);
         }
     } else {
         /* Destroy our sessions */

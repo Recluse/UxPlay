@@ -65,12 +65,12 @@ if (DBUS_FOUND)
       target_link_libraries( uxplay ${DBUS_LIBRARY})
 endif()
 
-# uxplay-core — the engine as an embeddable shared library with a flat C ABI
-# (lib/airplay_core.h).  Additive; off by default so normal exe builds are
-# unchanged.  Enable with -DBUILD_CORE_DLL=ON.
-option( BUILD_CORE_DLL "Build uxplay-core shared library for in-process embedding" OFF )
+# Plan B: uxplay-core.dll — the engine as an embeddable shared library with a
+# flat C ABI (lib/airplay_core.h).  Additive; off by default so normal exe
+# builds are unchanged.  Enable with -DBUILD_CORE_DLL=ON.
+option( BUILD_CORE_DLL "Build uxplay-core shared library for in-process embedding (Plan B)" OFF )
 if ( BUILD_CORE_DLL )
-  message( STATUS "will build uxplay-core shared library" )
+  message( STATUS "Plan B: will build uxplay-core shared library" )
   add_library( uxplay-core SHARED uxplay.cpp lib/airplay_core.cpp )
   target_link_libraries( uxplay-core renderers airplay )
   if (DBUS_FOUND)

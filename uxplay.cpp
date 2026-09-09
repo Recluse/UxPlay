@@ -24,6 +24,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <ctype.h>
+#include <atomic>   /* PATCH (Plan B): shutdown_requested is set from the host thread */
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -40,6 +41,7 @@
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
+#include <ws2tcpip.h>   /* struct sockaddr_in / sockaddr storage decls, for -bind */
 #include <iphlpapi.h>
 #include <pthread.h>   //for pthreads in MSYS2 UCRT
 #else
@@ -48,6 +50,8 @@
 #include <sys/utsname.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
+#include <net/if.h>      /* if_nametoindex(), IFF_UP, for -bind */
+#include <netinet/in.h>  /* struct sockaddr_in, for -bind */
 #include <sys/types.h>
 #include <pwd.h>
 # ifdef __linux__
@@ -65,6 +69,7 @@
 #include "lib/logger.h"
 #include "lib/dnssd.h"
 #include "lib/crypto.h"
+#include "lib/netutils.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "renderers/mux_renderer.h"
@@ -165,6 +170,8 @@ static guint min_password_length = MIN_PASSWORD_LENGTH;
 static unsigned short pin = 0;
 static std::string keyfile = "";
 static std::string mac_address = "";
+static std::string bind_address = "";
+static uint32_t bind_ifindex = 0;   /* 0 = advertise on every interface */
 static std::string dacpfile = "";
 static bool registration_list = false;
 static std::string pairing_register = "";
@@ -224,10 +231,151 @@ static const char *reason_active = "actively receiving video";
 static float previous_hls_position = 0.0f;
 #endif
 
+/* PATCH (Plan B): true when the engine runs INSIDE the host tray process
+ * (uxplay-core.dll/.dylib/.so) instead of the standalone exe.  Declared up here
+ * with the option statics because everything below has to know: in-process, an
+ * exit() or a hijacked signal disposition takes the user's whole application
+ * with it.  Set through airplay_set_library_mode() (defined near the bottom,
+ * with the rest of the C-ABI shims). */
+static bool library_mode = false;
+
+/* PATCH (Plan B, audit #1): a stop request can arrive while gmainloop is NULL --
+ * during startup (gst_init, the GStreamer registry scan, start_dnssd,
+ * start_raop_server) and again on EVERY reconnect, while main_loop() has
+ * returned and the video pipeline is being rebuilt.  A bare g_main_loop_quit()
+ * against a NULL loop is silently lost there and main_loop() then re-arms
+ * relaunch_video, so airplay_run_blocking() never returns and the host hangs
+ * forever inside worker.join() (on Windows/Linux that join is on the tao main
+ * thread: the whole tray freezes).  This latch outlives those windows.  It is
+ * set ONLY by airplay_request_shutdown() and cleared at the top of
+ * airplay_run_blocking(), so an ordinary reconnect never trips it. */
+static std::atomic<bool> shutdown_requested{false};
+
+/* PATCH (Plan B, audit #7): the host dlopen()s an engine image that is never
+ * unloaded and restarts the engine in-process (Settings save -> config watcher
+ * -> restart).  Every option static assigned only inside its own parse branch
+ * would therefore be a ONE-WAY SWITCH: ticking H265 after a 1080p start left
+ * display[] at 1920x1080 so 4K never activated, "-vs 0" kept mirroring black
+ * forever, clearing the audio-sink field kept the old sink, -d toggled itself
+ * off, and allowed/blocked_clients grew a duplicate entry per restart.
+ * Restore the DECLARED DEFAULT of everything parse_arguments() or
+ * read_config_file() can touch, from the top of airplay_run_blocking().
+ * KEEP THIS ADJACENT TO THE DECLARATIONS ABOVE: a new option static added
+ * there without a line here silently reintroduces the bug. */
+static void reset_options() {
+    server_name = DEFAULT_NAME;
+    server_name_is_utf8 = false;
+    audio_sync = false;
+    video_sync = true;
+    audio_delay_alac = 0;
+    audio_delay_aac = 0;
+    open_connections = 0;
+    videosink = "autovideosink";
+    videosink_options = "";
+    videoflip[0] = NONE;
+    videoflip[1] = NONE;
+    use_video = true;
+    compression_type = 0;
+    audiosink = "autoaudiosink";
+    audiodelay = -1;
+    use_audio = true;
+#if __APPLE__
+    new_window_closing_behavior = false;
+#else
+    new_window_closing_behavior = true;
+#endif
+    full_video_reset = true;
+    video_parser = "h264parse";
+    video_decoder = "decodebin";
+    video_converter = "videoconvert";
+    show_client_FPS_data = false;
+    /* the dump FILE*s are owned by cleanup(), which closes and NULLs them; only
+       the option state is reset here, or a still-open dump would leak. */
+    video_dumpfile_name = "videodump";
+    video_dump_limit = 0;
+    video_dumpfile_count = 0;
+    video_dump_count = 0;
+    dump_video = false;
+    audio_dumpfile_name = "audiodump";
+    audio_dump_limit = 0;
+    audio_dumpfile_count = 0;
+    audio_dump_count = 0;
+    dump_audio = false;
+    audio_type = 0x00;
+    previous_audio_type = 0x00;
+    fullscreen = false;
+    render_coverart = false;
+    coverart_filename = "";
+    metadata_filename = "";
+    do_append_hostname = true;
+    use_random_hw_addr = false;
+    for (int i = 0; i < 5; i++) display[i] = 0;   /* (a): 4K needs display[] back at 0 */
+    for (int i = 0; i < 3; i++) { tcp[i] = 0; udp[i] = 0; }
+    debug_log = DEFAULT_DEBUG_LOG;               /* (d): -d is a toggle, not a switch */
+    suppress_packet_debug_data = false;
+    log_level = LOGGER_INFO;
+    bt709_fix = false;
+    srgb_fix = DEFAULT_SRGB_FIX;
+    nohold = 0;
+    nofreeze = false;
+    allowed_clients.clear();                     /* parse only push_back()s these */
+    blocked_clients.clear();
+    restrict_clients = false;
+    setup_legacy_pairing = false;
+    pin_pw = 0;
+    password = "";
+    min_password_length = MIN_PASSWORD_LENGTH;
+    pin = 0;
+    keyfile = "";
+    mac_address = "";
+    bind_address = "";
+    bind_ifindex = 0;
+    dacpfile = "";
+    registration_list = false;
+    pairing_register = "";
+    registered_keys.clear();
+    db_low = -30.0;
+    db_high = 0.0;
+    taper_volume = false;
+    initial_volume = 0.0;
+    h265_support = false;
+    hls_support = false;
+    lang = "";
+    url = "";
+    missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
+    playbin_version = DEFAULT_PLAYBIN_VERSION;
+    artist.erase();
+    track_title.erase();
+    track_album.erase();
+    coverart_artist.erase();
+    ble_filename = "";
+    rtp_pipeline = "";
+    audio_rtp_pipeline = "";
+    mux_to_file = false;
+    mux_filename = "recording";
+    scrsv = 0;
+#ifdef DBUS
+    /* the D-Bus names are REWRITTEN in place at startup on Xfce/Mate
+       ("freedesktop" -> "xfce"); a second run would then find() nothing and
+       call replace(npos, ...).  cleanup() also unrefs the connection without
+       clearing it, so re-arm the whole block. */
+    dbus_service = "org.freedesktop.ScreenSaver";
+    dbus_path = "/org/freedesktop/ScreenSaver";
+    dbus_interface = "org.freedesktop.ScreenSaver";
+    dbus_inhibit = "Inhibit";
+    dbus_uninhibit = "UnInhibit";
+    dbus_connection = NULL;
+    dbus_cookie = 0;
+    dbus_pending = NULL;
+    dbus_last_message = false;
+    previous_hls_position = 0.0f;
+#endif
+}
+
 /* logging */
 
-/* Forward every uxplay log line to the embedding host so it can detect
- * connection markers ("Begin streaming", "Open connections: 0", ...).
+/* PATCH (Plan B): forward every uxplay log line to the embedding host so it can
+ * detect connection markers ("Begin streaming", "Open connections: 0", ...).
  * Declared here (before log()) because log() itself does the forwarding — that
  * single point catches BOTH uxplay.cpp's own LOGD/LOGI (e.g. "Open connections")
  * AND library messages (which arrive via log_callback -> LOGI -> log()). NULL in
@@ -575,7 +723,11 @@ static gboolean feedback_callback(gpointer loop) {
 }
 
 static gboolean reset_callback(gpointer loop) {
-    if (reset_loop) {
+    /* PATCH (audit #1): this 100ms tick is also the backstop for the shutdown
+       latch — it closes the one instant main_loop()'s own check cannot, between
+       that check and g_main_loop_run() arming the loop (a quit that lands in
+       between is dropped, because g_main_loop_run() sets is_running itself). */
+    if (reset_loop || shutdown_requested) {
         g_main_loop_quit((GMainLoop *) loop);
     }
     return TRUE;
@@ -738,27 +890,45 @@ static void main_loop()  {
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
 
-    /* Publish the running loop on ALL platforms so airplay_request_shutdown()
-     * can g_main_loop_quit() it from the host thread. Was previously under
-     * "#ifdef _WIN32" only -> on macOS/Linux gmainloop stayed NULL and
-     * airplay_core_stop() hung joining a worker still inside g_main_loop_run().
-     * On Windows this is unchanged (was already set). */
+    /* PATCH (Plan B / L1 fix): publish the running loop on ALL platforms so
+     * airplay_request_shutdown() can g_main_loop_quit() it from the host
+     * thread. Was previously under "#ifdef _WIN32" only -> on macOS/Linux
+     * gmainloop stayed NULL and airplay_core_stop() hung joining a worker still
+     * inside g_main_loop_run(). On Windows this is unchanged (was already set). */
     gmainloop = loop;
 #ifndef _WIN32
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
-    guint sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
-    guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
-    guint sighup_watch_id = g_unix_signal_add(SIGHUP, (GSourceFunc) sigint_callback, (gpointer) loop);
+    /* PATCH (Plan B, audit #19): never touch process-wide signal dispositions in
+       library mode.  They would point into an engine image the host may unload
+       (a later SIGTERM then jumps into unmapped memory instead of terminating
+       cleanly), and the tray app owns its own SIGINT/SIGTERM handling. */
+    guint sigterm_watch_id = 0, sigint_watch_id = 0, sighup_watch_id = 0;
+    if (!library_mode) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
+        sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
+        sighup_watch_id = g_unix_signal_add(SIGHUP, (GSourceFunc) sigint_callback, (gpointer) loop);
+    }
 #endif
-    g_main_loop_run(loop);
+    /* PATCH (Plan B, audit #1): the stop may already have been requested while
+       gmainloop was NULL — during startup, or during the pipeline rebuild
+       between two main_loop() calls.  Honour it here instead of running a loop
+       nobody will ever quit, and undo the relaunch_video re-arm above so the
+       reconnect gate in airplay_run_blocking() lets us out. */
+    if (shutdown_requested) {
+        relaunch_video = false;
+    } else {
+        g_main_loop_run(loop);
+    }
 
-    gmainloop = NULL;   /* clear on all platforms (was #ifdef _WIN32 only) */
+    gmainloop = NULL;   /* PATCH (Plan B / L1 fix): clear on all platforms (was #ifdef _WIN32 only) */
 #ifndef _WIN32
-    signal(SIGINT, CtrlHandler);  //switch back to non-mainloop CtrlHandler
-    signal(SIGTERM, CtrlHandler);
-    signal(SIGHUP, CtrlHandler);
+    if (!library_mode) {
+        signal(SIGINT, CtrlHandler);  //switch back to non-mainloop CtrlHandler
+        signal(SIGTERM, CtrlHandler);
+        signal(SIGHUP, CtrlHandler);
+    }
     if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
     if (sigterm_watch_id > 0) g_source_remove(sigterm_watch_id);
     if (sighup_watch_id > 0) g_source_remove(sighup_watch_id);
@@ -966,6 +1136,9 @@ static void print_info (char *name) {
     printf("-p n      Use TCP and UDP ports n,n+1,n+2. range %d-%d\n", LOWEST_ALLOWED_PORT, HIGHEST_PORT);
     printf("          use \"-p n1,n2,n3\" to set each port, \"n1,n2\" for n3 = n2+1\n");
     printf("          \"-p tcp n\" or \"-p udp n\" sets TCP or UDP ports separately\n");
+    printf("-bind ip  Bind all sockets to local IPv4 address \"ip\" and advertise the\n");
+    printf("          AirPlay service only on that adapter (disables IPv6);\n");
+    printf("          default: all adapters\n");
     printf("-avdec    Force software h264 video decoding with libav decoder\n"); 
     printf("-vp ...   Choose the GSteamer h264 parser: default \"h264parse\"\n");
     printf("-vd ...   Choose the GStreamer h264 decoder; default \"decodebin\"\n");
@@ -1215,13 +1388,23 @@ bool is_utf8(const char *string, bool *is_printable_ascii) {
     return true;
 }
 
-static void parse_arguments (int argc, char *argv[]) {
+/* PATCH (Plan B, audit #4): in library mode parse_arguments() runs on a worker
+ * thread INSIDE the host tray process, so exit()ing over a bad option kills the
+ * user's whole application -- and with autostart on, every later launch too,
+ * leaving no tray icon to open Settings and undo the typo.  Bail out with a
+ * failure code the caller reports instead; the standalone exe keeps the
+ * historical exit() status.  (Do not use this in helpers: it returns from
+ * parse_arguments.) */
+#define PARSE_BAIL(status) do { if (library_mode) return -1; exit(status); } while (0)
+
+/* returns 0 on success, -1 if an option was rejected (library mode only). */
+static int parse_arguments (int argc, char *argv[]) {
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         if (!is_utf8(argv[i], NULL)) {
             fprintf(stderr,"Error: detected a non-ascii or non-UTF-8 string \"%s\""
                     "while parsing input arguments", argv[i]);
-            exit(0);
+            PARSE_BAIL(0);
         }
     }
     for (int i = 1; i < argc; i++) {
@@ -1229,11 +1412,11 @@ static void parse_arguments (int argc, char *argv[]) {
         if (arg == "-rc") {
             i++;  //specifies startup file: has already been processed
         } else if (arg == "-allow") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             i++;
             allowed_clients.push_back(argv[i]);
         } else if (arg == "-block") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             i++;
             blocked_clients.push_back(argv[i]);    
         } else if (arg == "-restrict") {
@@ -1246,14 +1429,14 @@ static void parse_arguments (int argc, char *argv[]) {
 	    } 
             restrict_clients = true;
         } else if (arg == "-n") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             bool ascii;
             server_name_is_utf8 = false;
             server_name.erase();
             bool utf8 = is_utf8(argv[++i], &ascii);
             if (!utf8) {
                 fprintf(stderr, "invalid (non-UTF-8/ascii) server name in \"-n %s\"", argv[i]);
-                exit(1);
+                PARSE_BAIL(1);
             }
             server_name = std::string(argv[i]);
             if (!ascii) {
@@ -1279,22 +1462,22 @@ static void parse_arguments (int argc, char *argv[]) {
                         audio_delay_alac = n * 1000; /* units are nsecs */
                     } else {
                         fprintf(stderr, "invalid -async %s: requested delays must be smaller than +/- 1000 millisecs\n", argv[i] );
-                        exit (1);
+                        PARSE_BAIL(1);
                     }
                 }
             }
         } else if (arg == "-scrsv") {
-            if (!option_has_value(i, argc, argv[i], argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, argv[i], argv[i+1])) PARSE_BAIL(1);
             unsigned int n = 0;
             if (!get_value(argv[++i], &n) || n > 2) {
                 fprintf(stderr, "invalid \"-scrsv %s\"; values 0, 1, 2 allowed\n", argv[i]);
-                exit(1);
+                PARSE_BAIL(1);
             }
 #ifdef DBUS
             scrsv = n;
 #else
             fprintf(stderr,"invalid: option \"-scrsv\" is currently only implemented for Linux/*BSD systems with D-Bus service\n");
-            exit(1);
+            PARSE_BAIL(1);
 #endif
         } else if (arg == "-vsync") {
             video_sync = true;
@@ -1312,39 +1495,39 @@ static void parse_arguments (int argc, char *argv[]) {
                         audio_delay_aac = n * 1000;     /* units are nsecs */
                     } else {
                         fprintf(stderr, "invalid -vsync %s: requested delays must be smaller than +/- 1000 millisecs\n", argv[i]);
-                        exit (1);
+                        PARSE_BAIL(1);
                     }
                 }
             }
         } else if (arg == "-s") {
-            if (!option_has_value(i, argc, argv[i], argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, argv[i], argv[i+1])) PARSE_BAIL(1);
             std::string value(argv[++i]);
             if (!get_display_settings(value, &display[0], &display[1], &display[2])) {
                 fprintf(stderr, "invalid \"-s %s\"; -s wxh : max w,h=9999; -s wxh@r : max r=255\n",
                         argv[i]);
-                exit(1);
+                PARSE_BAIL(1);
             }
         } else if (arg == "-fps") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             unsigned int n = 255;
             if (!get_value(argv[++i], &n)) {
                 fprintf(stderr, "invalid \"-fps %s\"; -fps n : max n=255, default n=30\n", argv[i]);
-                exit(1);
+                PARSE_BAIL(1);
             }
             display[3] = (unsigned short) n;
         } else if (arg == "-o") {
             display[4] = 1;
         } else if (arg == "-f") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             if (!get_videoflip(argv[++i], &videoflip[0])) {
                 fprintf(stderr,"invalid \"-f %s\" , unknown flip type, choices are H, V, I\n",argv[i]);
-                exit(1);
+                PARSE_BAIL(1);
             }
         } else if (arg == "-r") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             if (!get_videorotate(argv[++i], &videoflip[1])) {
                 fprintf(stderr,"invalid \"-r %s\" , unknown rotation  type, choices are R, L\n",argv[i]);
-                exit(1);
+                PARSE_BAIL(1);
             }
         } else if (arg == "-p") {
             if (i == argc - 1 || argv[i + 1][0] == '-') {
@@ -1355,16 +1538,28 @@ static void parse_arguments (int argc, char *argv[]) {
             std::string value(argv[++i]);
             if (value == "tcp") {
                 arg.append(" tcp");
-                if(!get_ports(3, arg, argv[++i], tcp)) exit(1);
+                if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
+                if(!get_ports(3, arg, argv[++i], tcp)) PARSE_BAIL(1);
             } else if (value == "udp") {
                 arg.append( " udp");
-                if(!get_ports(3, arg, argv[++i], udp)) exit(1);
+                if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
+                if(!get_ports(3, arg, argv[++i], udp)) PARSE_BAIL(1);
             } else {
-                if(!get_ports(3, arg, argv[i], tcp)) exit(1);
+                if(!get_ports(3, arg, argv[i], tcp)) PARSE_BAIL(1);
                 for (int j = 0; j < 3; j++) {
                     udp[j] = tcp[j];
                 }
             }
+        } else if (arg == "-bind") {
+            /* Deliberately does not even fail the parse like the sibling
+               options do (PARSE_BAIL): a missing -bind argument degrades the
+               same way an unusable address does -- log it, pin nothing, listen
+               everywhere, keep mirroring -- and the next token is left for the
+               normal parse.  A moved cable must not stop the engine. */
+            if (!option_has_value(i, argc, arg, argv[i+1])) continue;
+            bind_address = argv[++i];
+            /* not validated here: "is this address on an up local adapter" needs
+               the adapter walk, which runs once at startup (see below). */
         } else if (arg == "-m") {
             if (i < argc - 1 && *argv[i+1] != '-') {
                 if (validate_mac(argv[++i])) {
@@ -1374,7 +1569,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 } else {
                     fprintf(stderr,"invalid mac address \"%s\": address must have form"
                             " \"xx:xx:xx:xx:xx:xx\", x = 0-9, A-F or a-f\n", argv[i]);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
             } else {
                 use_random_hw_addr  = true;
@@ -1386,7 +1581,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 unsigned int n = 1;
                 if (!get_value(argv[++i], &n)) {
                     fprintf(stderr, "invalid \"-d %s\"; -d n : max n=1 (suppress packet data in debug output)\n", argv[i]);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
                 debug_log = true;
                 suppress_packet_debug_data = true;
@@ -1396,24 +1591,24 @@ static void parse_arguments (int argc, char *argv[]) {
             }
         } else if (arg == "-h"  || arg == "--help" || arg == "-?" || arg == "-help") {
             print_info(argv[0]);
-            exit(0);
+            PARSE_BAIL(0);
         } else if (arg == "-v") {
             printf("UxPlay version %s; for help, use option \"-h\"\n", VERSION);
-            exit(0);
+            PARSE_BAIL(0);
         } else if (arg == "-vp") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             video_parser.erase();
             video_parser.append(argv[++i]);
         } else if (arg == "-vd") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             video_decoder.erase();
             video_decoder.append(argv[++i]);
         } else if (arg == "-vc") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             video_converter.erase();
             video_converter.append(argv[++i]);
         } else if (arg == "-vs") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             videosink.erase();
             videosink.append(argv[++i]);
             std::size_t pos = videosink.find(" ");
@@ -1423,13 +1618,13 @@ static void parse_arguments (int argc, char *argv[]) {
                 videosink.erase(pos);
             }
         } else if (arg == "-as") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             audiosink.erase();
             audiosink.append(argv[++i]);
         } else if (arg == "-t") {
             fprintf(stderr,"The uxplay option \"-t\" has been removed: it was a workaround for an  Avahi issue.\n");
             fprintf(stderr,"The correct solution is to open network port UDP 5353 in the firewall for mDNS queries\n");
-            exit(1);
+            PARSE_BAIL(1);
         } else if (arg == "-nc") {
             new_window_closing_behavior = false;
             if (i <  argc - 1) {
@@ -1459,7 +1654,7 @@ static void parse_arguments (int argc, char *argv[]) {
             fprintf(stderr,"     -rpigl was equivalent to \"-v4l2 -vs glimagesink\"\n");
             fprintf(stderr,"     -rpiwl was equivalent to \"-v4l2 -vs waylandsink\"\n");
             fprintf(stderr,"     Option \"-bt709\" may also be needed for R Pi model 4B and earlier\n");
-            exit(1);
+            PARSE_BAIL(1);
         } else if (arg == "-fs" ) {
             fullscreen = true;
         } else if (arg == "-FPSdata") {
@@ -1468,15 +1663,20 @@ static void parse_arguments (int argc, char *argv[]) {
             /* now using feedback  (every 1 sec ) instead of ntp timeouts (every 3 secs) to detect offline client and reset connections */
             fprintf(stderr,"*** NOTE CHANGE: -reset n now means reset n seconds (not 3n seconds) after client goes offline\n");	  
             missed_feedback_limit = 0;
+            /* PATCH (Plan B, audit #4): the only three options that reached
+               argv[++i] without this guard were -reset and -p tcp/-p udp; as
+               the LAST token they handed argv[argc] (NULL) to strlen()/
+               std::string and took the host tray down over a typo. */
+            if (!option_has_value(i, argc, arg, argv[i+1])) PARSE_BAIL(1);
             if (!get_value(argv[++i], &missed_feedback_limit)) {
                 fprintf(stderr, "invalid \"-reset %s\"; -reset n must have n >= 0,  default n = %d seconds\n", argv[i], MISSED_FEEDBACK_LIMIT);
-                exit(1);
+                PARSE_BAIL(1);
             }
 	} else if (arg == "-vrtp") {
 	  if (!option_has_value(i, argc, arg, argv[i+1])) {
 	    fprintf(stderr,"option \"-vrtp\" must be followed by a pipeline for sending the video stream:\n"
 		    "e.g., \"<rtph26[4,5]pay options> ! udpsink host=127.0.0.1 port -= 5000\"\n");
-	    exit(1);
+	    PARSE_BAIL(1);
           }
 	  rtp_pipeline.erase();
 	  rtp_pipeline.append(argv[++i]);
@@ -1484,7 +1684,7 @@ static void parse_arguments (int argc, char *argv[]) {
 	  if (!option_has_value(i, argc, arg, argv[i+1])) {
 	    fprintf(stderr,"option \"-artp\" must be followed by a pipeline for sending the audio stream:\n"
 		    "e.g., \"<rtpL16pay options> ! udpsink host=127.0.0.1 port=5002\"\n");
-	    exit(1);
+	    PARSE_BAIL(1);
           }
 	  audio_rtp_pipeline.erase();
 	  audio_rtp_pipeline.append(argv[++i]);
@@ -1495,7 +1695,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 if (get_value (argv[++i], &n)) {
                     if (n == 0) {
                         fprintf(stderr, "invalid \"-vdmp 0 %s\"; -vdmp n  needs a non-zero value of n\n", argv[i]);
-                        exit(1);
+                        PARSE_BAIL(1);
                     }
                     video_dump_limit = n;
                     if (option_has_value(i, argc, arg, argv[i+1])) {
@@ -1509,7 +1709,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = video_dumpfile_name.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-vdmp <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }   		
             }
         } else if (arg == "-mp4"){
@@ -1520,7 +1720,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = mux_filename.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-mp4 <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
             }
         } else if (arg == "-admp") {
@@ -1530,7 +1730,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 if (get_value (argv[++i], &n)) {
                     if (n == 0) {
                         fprintf(stderr, "invalid \"-admp 0 %s\"; -admp n  needs a non-zero value of n\n", argv[i]);
-                        exit(1);
+                        PARSE_BAIL(1);
                     }
                     audio_dump_limit = n;
                     if (option_has_value(i, argc, arg, argv[i+1])) {
@@ -1544,7 +1744,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = audio_dumpfile_name.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-admp <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
             }
         } else if (arg  == "-ca" ) {
@@ -1555,7 +1755,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 render_coverart = false;
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-ca <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }   
             } else {
                 render_coverart = true;
@@ -1567,11 +1767,11 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = metadata_filename.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-md <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }   
             } else {
                 fprintf(stderr,"option -md must be followed by a filename for metadata text output\n");
-                exit(1);
+                PARSE_BAIL(1);
             }
         } else if (arg  == "-ble" ) {
             ble_filename.erase();
@@ -1581,7 +1781,7 @@ static void parse_arguments (int argc, char *argv[]) {
                     ble_filename.append(argv[i]);
                     if (!file_has_write_access(argv[i])) {
                         fprintf(stderr, "%s cannot be written to:\noption \"-ble<fn>\" must be to a file with write access\n", argv[i]);
-                        exit(1);
+                        PARSE_BAIL(1);
                     }
                 }
             } else {
@@ -1591,11 +1791,11 @@ static void parse_arguments (int argc, char *argv[]) {
                     ble_filename.append("/.uxplay.ble");
                     if (!file_has_write_access(ble_filename.c_str())) {
                         fprintf(stderr, "%s cannot be written to\n",ble_filename.c_str()) ;
-                        exit(1);
+                        PARSE_BAIL(1);
                     }
                 } else {
                     fprintf(stderr,"failed to obtain home directory\n");
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
             }
         } else if (arg == "-bt709") {
@@ -1623,7 +1823,7 @@ static void parse_arguments (int argc, char *argv[]) {
             }
             fprintf(stderr, "invalid -al %s: value must be a decimal time offset in seconds, range [0,10]\n"
                     "(like 5 or 4.8, which will be converted to a whole number of microseconds)\n", argv[i]);
-            exit(1);
+            PARSE_BAIL(1);
         } else if (arg == "-pin") {
             setup_legacy_pairing = true;
             pin_pw = 1;
@@ -1631,7 +1831,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 unsigned int n = 9999;
                 if (!get_value(argv[++i], &n)) {
                     fprintf(stderr, "invalid \"-pin %s\"; -pin nnnn : max nnnn=9999, (4 digits)\n", argv[i]);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
                 pin = n + 10000;
             }
@@ -1643,7 +1843,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char * fn = pairing_register.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-reg <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }   
             }
         } else if (arg == "-key") {
@@ -1653,7 +1853,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char * fn = keyfile.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-key <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }   
             } else {
 	        //                fprintf(stderr, "option \"-key <fn>\" requires a path <fn> to a file for persistent key storage\n");
@@ -1669,7 +1869,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 pin_pw = 2;
                 if (password.size() < min_password_length) {
                     fprintf(stderr, "invalid client-access password \"%s\": length must be at least %u characters\n", password.c_str(), min_password_length);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
             } else {
                 pin_pw = 3;  //a random password (pin) will be displayed at each connection
@@ -1681,10 +1881,17 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = dacpfile.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-dacp <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }   
             } else {
-                dacpfile.append(get_homedir());
+                /* get_homedir() can be NULL (no $HOME); std::string::append(NULL)
+                   is UB -- every other homedir user here already tests it */
+                const char *homedir = get_homedir();
+                if (!homedir) {
+                    fprintf(stderr, "could not determine $HOME: option \"-dacp\" needs a filename\n");
+                    PARSE_BAIL(1);
+                }
+                dacpfile.append(homedir);
                 dacpfile.append("/.uxplay.dacp");
             }
         } else if (arg == "-taper") {
@@ -1706,8 +1913,10 @@ static void parse_arguments (int argc, char *argv[]) {
                 }
             }
             if (db_bad) {
-                fprintf(stderr, "invalid \"-db  %s\": db value must be \"low\" or \"low:high\", low < 0 and high > low are decibel gains\n", argv[i+1]); 
-                exit(1);
+                /* argv[i+1] is NULL when -db is the last token (%s of NULL is UB) */
+                fprintf(stderr, "invalid \"-db  %s\": db value must be \"low\" or \"low:high\", low < 0 and high > low are decibel gains\n",
+                        i < argc - 1 ? argv[i+1] : "");
+                PARSE_BAIL(1);
             }
             i++;
             db_low = db1;
@@ -1730,22 +1939,32 @@ static void parse_arguments (int argc, char *argv[]) {
                         //db = (db > db_flat) ? db : db_flat;
                         initial_volume = db_flat;
                     }
+                    /* PATCH (Plan B): both of these used to sit OUTSIDE this test,
+                       so "-vol -h265" printed the untouched default, reported no
+                       error, and then i++ swallowed "-h265" — the engine came up
+                       green with H265 silently off and nothing in the log. */
+                    printf("initial_volume attenuation %f db\n", initial_volume);
+                    vol_bad = false;
                 }
-                printf("initial_volume attenuation %f db\n", initial_volume);
-                vol_bad = false;
             }
             if (vol_bad) {
-                fprintf(stderr, "invalid \"-vol %s\", value must be between 0.0 (mute) and 1.0 (full volume)\n", argv[i+1]);
-                exit(1);
+                /* same NULL as -db: vol_bad stays true only when -vol was last */
+                fprintf(stderr, "invalid \"-vol %s\", value must be between 0.0 (mute) and 1.0 (full volume)\n",
+                        i < argc - 1 ? argv[i+1] : "");
+                PARSE_BAIL(1);
             }
             i++;
         } else if (arg == "-hls") {
             hls_support = true;
             if (i < argc - 1 && *argv[i+1] != '-') {
                 unsigned int n = 3;
-                if (!get_value(argv[++i], &n) || playbin_version < 2) {
+                /* PATCH (Plan B): this tested playbin_version (still the default 3
+                   here) instead of the value just parsed, so "-hls 4" was accepted
+                   and reached video_renderer_init's g_assert(0) -- an abort that
+                   takes the whole host app down, from a typo in Settings. */
+                if (!get_value(argv[++i], &n) || n < 2 || n > 3) {
                     fprintf(stderr, "invalid \"-hls %s\"; -hls n only allows \"playbin\" video player versions 2 or 3\n", argv[i]);
-                    exit(1);
+                    PARSE_BAIL(1);
                 }
                 playbin_version = (guint) n;
             }
@@ -1760,9 +1979,10 @@ static void parse_arguments (int argc, char *argv[]) {
             nofreeze = true;
         } else {
             fprintf(stderr, "unknown option %s, stopping (for help use option \"-h\")\n",argv[i]);
-            exit(1);
+            PARSE_BAIL(1);
         }
     }
+    return 0;
 }
 
 static void process_metadata(int count, const char *dmap_tag, const unsigned char* metadata, int datalen, std::string *metadata_text) {
@@ -1885,15 +2105,12 @@ static void process_metadata(int count, const char *dmap_tag, const unsigned cha
     }
 
     if (dmap_type == 9) {
-        char *str = (char *) calloc(datalen + 1, sizeof(char));
-        if (!str) {
-            printf("Memeory allocation failure (str)\n");
-            exit(1);
-        }
-        memcpy(str, metadata, datalen);
-        metadata_text->append(str);
+        /* PATCH (Plan B, audit #4): was a calloc()ed NUL-terminated copy whose
+           failure exit(1)ed -- i.e. killed the host tray from a metadata
+           callback.  append(first, last) needs no allocation at all; the
+           track_title append above already does it this way. */
+        metadata_text->append(metadata, metadata + datalen);
         metadata_text->append("\n");
-        free(str);
     } else if (debug_log) {
         std::string md = "";
         char hex[4];
@@ -1935,7 +2152,33 @@ static int parse_dmap_header(const unsigned char *metadata, char *tag, int *len)
 static int register_dnssd() {
     int dnssd_error;
     uint64_t features;
-    
+
+#ifdef _WIN32
+    /* PATCH (Plan B): say WHICH dnssd.dll got loaded, in the APPLICATION log.
+     *
+     * Our shim exports PopyachsaShimVersion(); Apple's Bonjour dnssd.dll does
+     * not, so a missing symbol is itself the answer. The shim cannot report this
+     * on its own: it writes to stderr, and the tray is a GUI binary with no
+     * console, so nothing it prints is captured — measured on Windows, where a
+     * registration demonstrably happened, the engine logged it, and not one
+     * [dnssd_shim] line reached the log. Moving the shim's announcement out of
+     * DllMain fixed the timing but not the channel; this is the channel.
+     *
+     * Optional by construction, so an older shim (or Apple's) is not an error.
+     * Once per process: register_dnssd runs once per engine start, and the tray
+     * restarts the engine on every settings change. */
+    static bool dnssd_dll_identified = false;
+    if (!dnssd_dll_identified) {
+        dnssd_dll_identified = true;
+        HMODULE dll = GetModuleHandleA("dnssd.dll");   /* already loaded by dnssd_init */
+        typedef const char * (__stdcall *shim_version_t)(void);
+        shim_version_t shim_version = dll
+            ? (shim_version_t) GetProcAddress(dll, "PopyachsaShimVersion") : NULL;
+        LOGI("dnssd.dll: %s", shim_version ? shim_version()
+             : "no PopyachsaShimVersion export — Apple Bonjour, or a shim older than 1.1.0");
+    }
+#endif
+
     dnssd_error = dnssd_register_raop(dnssd, raop_port);
     if (dnssd_error) {
         if (ble_filename.empty()) {
@@ -2007,6 +2250,10 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
     if (dnssd_error) {
         LOGE("Could not initialize dnssd library!: error %d", dnssd_error);
         return 1;
+    }
+
+    if (bind_ifindex) {
+        dnssd_set_interface_index(dnssd, bind_ifindex);   /* 0 = advertise everywhere */
     }
 
     /* after dnssd starts, reset the default feature set here 
@@ -2684,8 +2931,8 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
     }
 }
 
-/* Setter for the host log-forward (the typedef + globals are declared up by
- * log(), which is the single forwarding point — see there). */
+/* PATCH (Plan B): setter for the host log-forward (the typedef + globals are
+ * declared up by log(), which is the single forwarding point — see there). */
 extern "C" void airplay_set_log_forward (airplay_log_forward_fn fn, void *user) {
     g_log_forward = fn;
     g_log_forward_user = user;
@@ -2806,7 +3053,9 @@ static void stop_raop_server () {
     return;
 }
 
-static void read_config_file(const char * filename, const char * uxplay_name) {
+/* returns 0, or -1 if the file held an option parse_arguments() rejected
+   (library mode only -- see PARSE_BAIL). */
+static int read_config_file(const char * filename, const char * uxplay_name) {
     std::string config_file = filename;
     std::string option_char = "-";
     std::vector<std::string> options;
@@ -2877,38 +3126,214 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
     if (options.size() > 1) {
 
         int argc = options.size();
-        char **argv = (char **) malloc(sizeof(char*) * argc);
+        /* PATCH (Plan B): argc + 1 and a NULL terminator.  parse_arguments reads
+           argv[i+1] as a call argument to option_has_value() -- that read happens
+           before the function's own i >= argc - 1 guard can short-circuit it -- so
+           a trailing valueless option ("fps" as the last rc-file line) read one
+           past the end of this array.  A real argv is NULL-terminated by the C
+           standard and airplay_core.cpp already terminates its own; this makes the
+           rc-file path match, for all ~19 options that take a value. */
+        char **argv = (char **) malloc(sizeof(char*) * (argc + 1));
         if (argv == NULL) {
             printf("Memory allocation failure (argV)\n");
+            /* the caller already reports a -1 from here as "bad startup file"
+               and fails the RUN, so this need not fail the host PROCESS */
+            if (library_mode) return -1;
             exit(1);
         }
         for (int i = 0; i < argc; i++) {
             argv[i] = (char *) options[i].c_str();
         }
-        parse_arguments (argc, argv);
+        argv[argc] = NULL;
+        int rc = parse_arguments (argc, argv);
         free (argv);
+        return rc;
     }
+    return 0;
 }
 
-/* The former body of main() is now a reusable C-ABI entry point.  It is driven
- * either by the standalone uxplay.exe main() (defined right after this function)
- * or by the uxplay-core shared library's worker thread (lib/airplay_core.cpp).
- * All the file-static option/runtime globals are kept as-is: the engine is
- * single-instance by design. */
+/* Is ip an address of an up, non-loopback local adapter, and what is that
+ * adapter's interface index?  This is the only real validation of -bind:
+ * an address no adapter owns would otherwise surface as an opaque
+ * EADDRNOTAVAIL from inside httpd.
+ *
+ * addr6 (16 bytes) and scope6 come back as the SAME adapter's link-local IPv6,
+ * for the v6 half of the pin -- see netutils_set_bind_address6().  They are
+ * left untouched when the adapter has no link-local, so the caller's zeroed
+ * buffer means "v6 pin not available" and the v6 listener stays on
+ * in6addr_any.  Not finding one is not a failure: the return value still only
+ * reports whether the IPv4 was resolved. */
+static bool resolve_bind_address(const char *ip, uint32_t *ifindex,
+                                 unsigned char *addr6, unsigned int *scope6) {
+    unsigned int want;
+    /* netutils_parse_ipv4(), not inet_pton(): the latter is a Winsock call and
+     * netutils_init()'s WSAStartup does not run until raop_init(), well below
+     * this point, so on Windows inet_pton() would reject every valid address. */
+    if (netutils_parse_ipv4(ip, &want) < 0) {
+        return false;
+    }
+    *ifindex = 0;
+#ifdef _WIN32
+    /* Same call and the same buffer dance as find_mac() above; GetAdaptersAddresses
+     * needs no Winsock init, which matters because netutils_init() has not run
+     * yet -- see the parse above for the half that did.
+     *
+     * AF_UNSPEC, not AF_INET: the same adapter record then also carries the
+     * link-local IPv6 we need for the v6 half of the pin, so one walk answers
+     * both questions.  IfIndex, not Ipv6IfIndex, is still the right index to
+     * report: the shim's mDNS socket is IPv4.  Until now the index was
+     * deliberately left at 0, because
+     * our bundled dnssd.dll shim (github.com/Recluse/AirPlay-DNS-SD-Shim) threw
+     * interfaceIndex away and guessed an adapter by scoring, so a real index
+     * bought nothing while a wrong one (1 = Loopback Pseudo-Interface) would
+     * have advertised the receiver where no client can see it.  As of the shim
+     * change landing alongside this one it honours the index, so pass the real
+     * one.  The two DLLs need not ship together: an old shim ignores the index
+     * we now send, and an old core never calls dnssd_set_interface_index(), so
+     * a new shim receives the calloc'd 0 and guesses exactly as before.  The
+     * one path where even an old shim reacts is its Bonjour proxy (Apple's
+     * service installed): it forwards interfaceIndex verbatim, and Apple's
+     * responder scopes registrations by the same Windows IfIndex. */
+    ULONG buflen = sizeof(IP_ADAPTER_ADDRESSES);
+    PIP_ADAPTER_ADDRESSES addresses = (IP_ADAPTER_ADDRESSES*) malloc(buflen);
+    if (addresses == NULL) {
+        return false;
+    }
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addresses, &buflen) == ERROR_BUFFER_OVERFLOW) {
+        free(addresses);
+        addresses = (IP_ADAPTER_ADDRESSES*) malloc(buflen);
+        if (addresses == NULL) {
+            return false;
+        }
+    }
+    bool found = false;
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addresses, &buflen) == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES address = addresses; address != NULL && !found; address = address->Next) {
+            if (address->OperStatus != 1          /* IfOperStatusUp */
+                || address->IfType == 24) {       /* IF_TYPE_SOFTWARE_LOOPBACK */
+                continue;   /* numeric like find_mac() above: the named constants
+                               live in headers iphlpapi.h does not always pull in */
+            }
+            for (PIP_ADAPTER_UNICAST_ADDRESS ua = address->FirstUnicastAddress; ua != NULL; ua = ua->Next) {
+                struct sockaddr *sa = (struct sockaddr *) ua->Address.lpSockaddr;
+                if (sa == NULL || sa->sa_family != AF_INET) continue;
+                if (((struct sockaddr_in *) sa)->sin_addr.s_addr == want) {
+                    *ifindex = address->IfIndex;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) continue;
+            /* Same adapter's link-local IPv6, for the v6 half of the pin: iOS
+               was measured connecting over IPv6 link-local, so pinning only the
+               v4 leaves httpd with no v6 listener and the phone locked out.  No
+               KAME hack here -- Windows fills sin6_scope_id properly and keeps
+               the address canonical. */
+            for (PIP_ADAPTER_UNICAST_ADDRESS ua = address->FirstUnicastAddress; ua != NULL; ua = ua->Next) {
+                struct sockaddr *sa = (struct sockaddr *) ua->Address.lpSockaddr;
+                if (sa == NULL || sa->sa_family != AF_INET6) continue;
+                struct sockaddr_in6 *s6 = (struct sockaddr_in6 *) sa;
+                unsigned char *a = s6->sin6_addr.s6_addr;
+                if (!(a[0] == 0xfe && (a[1] & 0xc0) == 0x80)) continue;   /* fe80::/10 */
+                if (s6->sin6_scope_id == 0) continue;
+                memcpy(addr6, a, 16);
+                *scope6 = s6->sin6_scope_id;
+                break;
+            }
+        }
+    }
+    free(addresses);
+    return found;
+#else
+    struct ifaddrs *ifap, *ifaptr;
+    if (getifaddrs(&ifap) != 0) {
+        return false;
+    }
+    bool found = false;
+    const char *ifname = NULL;
+    for (ifaptr = ifap; ifaptr != NULL; ifaptr = ifaptr->ifa_next) {
+        if (ifaptr->ifa_addr == NULL) continue;
+        if (ifaptr->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifaptr->ifa_flags & IFF_UP) || (ifaptr->ifa_flags & IFF_LOOPBACK)) continue;
+        if (((struct sockaddr_in *) ifaptr->ifa_addr)->sin_addr.s_addr != want) continue;
+        *ifindex = if_nametoindex(ifaptr->ifa_name);
+        ifname = ifaptr->ifa_name;
+        found = true;
+        break;
+    }
+    /* Second pass for the same adapter's link-local IPv6.  Same adapter, not
+       just any: iOS reaches the receiver over IPv6 link-local (measured -- an
+       iPhone 14 connected from fe80::0c9c:1882:ab4b:403c%15), so the pin has to
+       name a v6 address or httpd ends up with no v6 listener and that phone
+       cannot connect at all.  A global v6 would do as well, but every LAN has
+       a link-local and not every LAN has v6 routing. */
+    if (found) {
+        for (ifaptr = ifap; ifaptr != NULL; ifaptr = ifaptr->ifa_next) {
+            if (ifaptr->ifa_addr == NULL) continue;
+            if (ifaptr->ifa_addr->sa_family != AF_INET6) continue;
+            if (strcmp(ifaptr->ifa_name, ifname) != 0) continue;
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *) ifaptr->ifa_addr;
+            unsigned char *a = s6->sin6_addr.s6_addr;
+            if (!(a[0] == 0xfe && (a[1] & 0xc0) == 0x80)) continue;   /* fe80::/10 */
+            unsigned int scope = s6->sin6_scope_id;
+            /* KAME hack: the BSDs historically hand back link-locals with the
+               scope stuffed into bytes 2-3 of the address and sin6_scope_id
+               left at 0, which would bind a bogus address with no scope.  This
+               macOS (Darwin 25) fills sin6_scope_id and leaves those bytes
+               clear -- verified with getifaddrs on en0 -- but the fallback
+               costs two lines and the zeroing is a no-op on a canonical
+               fe80::/64 address, where bytes 2-3 are zero by definition. */
+            if (scope == 0) {
+                scope = ((unsigned int) a[2] << 8) | a[3];
+            }
+            if (scope == 0) continue;
+            memcpy(addr6, a, 16);
+            addr6[2] = addr6[3] = 0;
+            *scope6 = scope;
+            break;
+        }
+    }
+    freeifaddrs(ifap);
+    return found;
+#endif
+}
+
+/* PATCH (Plan B): the former body of main() is now a reusable C-ABI entry
+ * point.  It is driven either by the standalone uxplay.exe main() (defined
+ * right after this function) or by uxplay-core.dll's worker thread
+ * (lib/airplay_core.cpp).  All the file-static option/runtime globals are kept
+ * as-is: the engine is single-instance by design. */
 extern "C" int airplay_run_blocking (int argc, char *argv[]) {
     std::vector<char> server_hw_addr;
     std::string config_file = "";
 
+    /* File statics outlive an engine restart: the tray app re-dlopen()s an image
+     * that is never unloaded, and nothing else resets these globals.  An option
+     * that is only ever *set* by its parse block would therefore stick forever
+     * -- switching the adapter selector back to Automatic would do nothing. */
+    reset_options();
+    /* NOTE: shutdown_requested is deliberately NOT cleared here.  The host
+     * clears it in airplay_core_start(), before this thread exists -- see
+     * airplay_clear_shutdown_request().  Clearing it here would discard a stop
+     * that arrived in the gap between airplay_core_start() returning and this
+     * function beginning, which is precisely the request the latch exists to
+     * keep (measured: a stop issued 0 ms after start hit that gap every time). */
+
+    /* PATCH (Plan B, audit #19): process-wide handlers only in the standalone
+     * exe.  In library mode they would point into an image the host may unload,
+     * and stealing SIGINT/SIGTERM from the tray app is not ours to do. */
+    if (!library_mode) {
 #ifdef _WIN32
-    if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        LOGE("Could not set control handler");
-        exit(1);
-    }
+        if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
+            LOGE("Could not set control handler");
+            exit(1);
+        }
 #else
-    signal(SIGINT, CtrlHandler);
-    signal(SIGTERM, CtrlHandler);
-    signal(SIGHUP, CtrlHandler);
+        signal(SIGINT, CtrlHandler);
+        signal(SIGTERM, CtrlHandler);
+        signal(SIGHUP, CtrlHandler);
 #endif
+    }
 
 #ifdef __OpenBSD__
     if (unveil("/", "rwc") == -1 || unveil(NULL, NULL) == -1) {
@@ -2938,11 +3363,13 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
             struct stat sb;
             if (i+1 == argc) {
                 LOGE ("option -rc requires a filename  (-rc <filename>)");
+                if (library_mode) return -1;   /* audit #4: never exit() the host */
                 exit(1);
             }
             rcfile = argv[i+1];
             if (stat(rcfile, &sb) == -1) {
                 LOGE("startup file %s specified by option -rc was not found", rcfile);
+                if (library_mode) return -1;
                 exit(0);
             }
             break;
@@ -2953,10 +3380,21 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
     } else {	
         config_file = find_uxplay_config_file();
     }
+    /* PATCH (Plan B, audit #4): a rejected option now fails the RUN instead of
+     * the PROCESS.  LOGE goes through the host's log-forward hook, so the tray
+     * can show why the engine did not start; the standalone exe never gets
+     * here (parse_arguments exit()s as before). */
     if (config_file.length()) {
-        read_config_file(config_file.c_str(), argv[0]);
+        if (read_config_file(config_file.c_str(), argv[0])) {
+            LOGE("stopping: bad option in startup file %s", config_file.c_str());
+            return -1;
+        }
     }
-    parse_arguments (argc, argv);
+    if (parse_arguments (argc, argv)) {
+        LOGE("stopping: engine started with an option it does not accept"
+             " (see the message above; check Settings -> Advanced)");
+        return -1;
+    }
 
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
     if (debug_log && suppress_packet_debug_data) {
@@ -3089,7 +3527,13 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
         video_parser.append(BT709_FIX);
     }
 
-    if (srgb_fix && use_video) {
+    /* PATCH (Plan B): SRGB_FIX forces a CPU videoconvert to RGB (Apple's full-range
+     * sRGB colorimetry fix). ximagesink is a software RGB sink and needs it, but
+     * xvimagesink hands YUV straight to the XVideo overlay, which colour-converts
+     * and scales in hardware — there the conversion is pure CPU cost and was a
+     * measured cause of 4K stutter. Pairs with skipping the CPU videoscale in
+     * renderers/video_renderer.c. */
+    if (srgb_fix && use_video && videosink.find("xvimagesink") == std::string::npos) {
         std::string option = video_converter;
         video_converter.append(SRGB_FIX);
         video_converter.append(option);
@@ -3148,6 +3592,8 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
 
     if (!gstreamer_init()) {
         LOGE ("stopping");
+        if (library_mode) return -1;   /* audit #4: a broken GStreamer must not
+                                          take the host tray process down */
         exit (1);
     }
 
@@ -3180,6 +3626,41 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
 
     if (udp[0]) {
         LOGI("using network ports UDP %d %d %d TCP %d %d %d", udp[0], udp[1], udp[2], tcp[0], tcp[1], tcp[2]);
+    }
+
+    /* Unconditional: netutils' statics survive a restart too, so an engine run
+       without -bind must actively clear the previous run's pin. */
+    netutils_set_bind_address(NULL);
+    bind_ifindex = 0;
+    if (!bind_address.empty()) {
+        /* Zeroed: resolve_bind_address() only writes these if the adapter has a
+           link-local IPv6, and scope 0 is how netutils reads "none, stay on
+           in6addr_any". */
+        unsigned char bind_addr6[16] = {0};
+        unsigned int bind_scope6 = 0;
+        if (!resolve_bind_address(bind_address.c_str(), &bind_ifindex, bind_addr6, &bind_scope6) ||
+            netutils_set_bind_address(bind_address.c_str()) < 0) {
+            /* Deliberately NOT exit(1) like the other option errors: this runs
+               inside the tray process, so a moved cable must not take the app
+               down with it.  Fall back to the pre-feature behaviour and say so. */
+            LOGE("no up local adapter has address %s -- listening on all adapters",
+                 bind_address.c_str());
+            bind_address.clear();
+            bind_ifindex = 0;
+        } else {
+            netutils_set_bind_address6(bind_addr6, bind_scope6);
+            if (bind_scope6) {
+                LOGI("bound to %s and to that adapter's IPv6 link-local (scope %u, mDNS interface index %u); loopback listeners are off",
+                     bind_address.c_str(), bind_scope6, bind_ifindex);
+            } else {
+                /* Not fatal on purpose: iOS often connects over IPv6
+                   link-local, so dropping the v6 listener would break the
+                   receiver outright.  Half a pin that works beats a whole one
+                   that does not. */
+                LOGI("bound to %s (mDNS interface index %u); adapter has no IPv6 link-local, so the IPv6 listener stays on all adapters",
+                     bind_address.c_str(), bind_ifindex);
+            }
+        }
     }
 
     if (!use_random_hw_addr) {
@@ -3219,7 +3700,7 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
 
     if (start_dnssd(server_hw_addr, server_name)) {
         cleanup();
-        return 1;   /* cleanup() returns in library mode */
+        return 1;   /* PATCH (Plan B): cleanup() returns in library mode */
     }
     if (start_raop_server(display, tcp, udp, debug_log)) {
         stop_dnssd();
@@ -3255,23 +3736,23 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
     compression_type = 0;
     close_window = new_window_closing_behavior;
     main_loop();
-    if (relaunch_video) {
+    /* PATCH (Plan B, audit #1): the latch also gates the RECONNECT arm.  A stop
+       that raced a client disconnect (which sets relaunch_video = true from a
+       raop callback) would otherwise buy a full pipeline rebuild before the
+       next main_loop() noticed -- seconds of a host thread blocked in join(). */
+    if (relaunch_video && !shutdown_requested) {
         if (reset_httpd) {
             raop_stop_httpd(raop);
         }
         if (use_audio) {
             audio_renderer_stop();
         }
-        /* On macOS ALWAYS re-init the video pipeline on reconnect.  Reusing the
-         * post-disconnect pipeline leaves a shown-but-blank window (no frames
-         * render after a few cycles) and previously tripped the renderer-listen
-         * assert. A fresh pipeline per reconnect renders reliably.  Other
-         * platforms keep the original (reuse-when-possible) behaviour. */
-#ifdef __APPLE__
-        if (use_video) {
-#else
-        if (use_video && (close_window || preserve_connections || full_video_reset)) {
-#endif
+        /* PATCH (Plan B): a live mirror (url.empty()) ALWAYS rebuilds a fresh video
+         * pipeline on reconnect — reusing the post-disconnect pipeline left a
+         * shown-but-blank window and tripped the renderer-lifecycle bug. With the
+         * h265-reconnect fix (NULL'd slots + mirror-thread JOIN before reset) this is
+         * the shared, correct gate (HLS keeps the original reuse-when-possible path). */
+        if (use_video && (url.empty() || close_window || preserve_connections || full_video_reset)) {
             video_renderer_destroy();
             if (!preserve_connections) {
                 url.erase();
@@ -3303,19 +3784,33 @@ extern "C" int airplay_run_blocking (int argc, char *argv[]) {
     return 0;
 }
 
-/* Request a clean shutdown from another thread (the embedding host).
+/* PATCH (Plan B): request a clean shutdown from another thread (the DLL host).
  * gmainloop and relaunch_video are file-statics in this TU, so the shim lives
  * here.  Mirrors the handle_signal() path: drop the reconnect loop, then quit
- * the running GMainLoop so airplay_run_blocking() returns. */
+ * the running GMainLoop so airplay_run_blocking() returns.
+ *
+ * The latch is set FIRST and unconditionally (audit #1): most of an engine
+ * run has no live gmainloop to quit, and the quit alone would be dropped. */
 extern "C" void airplay_request_shutdown (void) {
     relaunch_video = false;
+    shutdown_requested = true;
     if (gmainloop) {
         g_main_loop_quit(gmainloop);
     }
 }
 
-/* Host HWND for the renderer, set before airplay_run_blocking() by the
- * embedding host.  renderers/video_renderer.c reads it via
+/* Arm a fresh run.  Called by airplay_core_start() from the HOST thread before
+ * the worker is spawned, never by the worker: airplay_core_start() returns
+ * immediately, so a stop can legitimately arrive before airplay_run_blocking()
+ * has begun, and a clear inside the worker would swallow it (verified: with a
+ * clear at the top of airplay_run_blocking, a stop 0 ms after start left the
+ * engine running and airplay_core_stop() blocked in join() forever). */
+extern "C" void airplay_clear_shutdown_request (void) {
+    shutdown_requested = false;
+}
+
+/* PATCH (Plan B): host HWND for the renderer, set before airplay_run_blocking()
+ * by the DLL host.  renderers/video_renderer.c reads it via
  * airplay_get_host_window() in its GstVideoOverlay block, instead of the
  * UXPLAY_OVERLAY_HWND env var (which remains as a fallback for the exe). */
 static void *g_host_window_handle = NULL;
@@ -3326,11 +3821,11 @@ extern "C" void *airplay_get_host_window (void) {
     return g_host_window_handle;
 }
 
-/* When embedded as the uxplay-core shared library, cleanup() must NOT exit()
+/* PATCH (Plan B): when embedded as uxplay-core.dll, cleanup() must NOT exit()
  * the host process — it returns so the engine can be stopped and started again
  * in the same process.  The standalone exe leaves this false (cleanup exits as
- * before). */
-static bool library_mode = false;
+ * before).  The flag itself is declared with the option statics at the top,
+ * because parse_arguments() and main_loop() consult it too. */
 extern "C" void airplay_set_library_mode (int on) {
     library_mode = (on != 0);
 }
@@ -3358,12 +3853,18 @@ static void cleanup() {
     }
     logger_destroy(render_logger);
     render_logger = NULL;
+    /* PATCH (Plan B, audit #15): NULL them like every other fclose site here.
+       In library mode cleanup() RETURNS, so a dangling pointer would fail the
+       "if (!video_dumpfile)" open test on the next engine start and the first
+       packet would fwrite into a closed FILE inside the tray process. */
     if(audio_dumpfile) {
         fclose(audio_dumpfile);
+        audio_dumpfile = NULL;
     }
     if (video_dumpfile) {
         fwrite(mark, 1, sizeof(mark), video_dumpfile);
         fclose(video_dumpfile);
+        video_dumpfile = NULL;
     }
     if (coverart_filename.length()) {
         remove (coverart_filename.c_str());
@@ -3387,9 +3888,9 @@ static void cleanup() {
         dbus_connection_unref(dbus_connection);
     }
 #endif
-    /* In library mode, return instead of killing the process so the engine can
-     * be restarted; error-path callers in airplay_run_blocking follow their
-     * cleanup() with `return 1` so they don't fall through. */
+    /* PATCH (Plan B): in library mode, return instead of killing the process so
+     * the engine can be restarted; error-path callers in airplay_run_blocking
+     * follow their cleanup() with `return 1` so they don't fall through. */
     if (library_mode) {
         return;
     }

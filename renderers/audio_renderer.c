@@ -121,7 +121,15 @@ static gboolean check_plugin_feature (const gchar *needed_feature)
 }
 
 bool gstreamer_init(){
-    gst_init(NULL,NULL);    
+    /* PATCH (Plan B, audit #6): gst_init() exits the process itself when it fails,
+       so the caller's library-mode "return -1" could never run.  gst_init_check()
+       is the variant that reports the failure back instead. */
+    GError *error = NULL;
+    if (!gst_init_check (NULL, NULL, &error)) {
+        g_print ("GStreamer initialization failed: %s\n", error ? error->message : "unknown error");
+        g_clear_error (&error);
+        return false;
+    }
     return (bool) check_plugins ();
 }
 
@@ -137,7 +145,27 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
     }
 
     logger = render_logger;
-    
+
+    /* PATCH (Plan B, audit #4): the sink description comes straight from the
+       host's Settings field, and a config authored on Windows can carry
+       "wasapisink" to Linux.  A sink that does not build used to surface as the
+       g_error() below -- G_LOG_LEVEL_ERROR is ALWAYS fatal, so that was an
+       abort() inside the user's tray process the moment a device connected.
+       Probe it once here and fall back to a sink that always exists. */
+    if (!audio_rtp && audiosink && *audiosink) {
+        GError *probe_error = NULL;
+        GstElement *probe = gst_parse_launch (audiosink, &probe_error);
+        if (probe_error || !probe) {
+            logger_log(logger, LOGGER_ERR, "audio sink \"%s\" is unusable (%s): using \"autoaudiosink\"",
+                       audiosink, probe_error ? probe_error->message : "could not be created");
+            g_clear_error (&probe_error);
+            audiosink = "autoaudiosink";
+        }
+        if (probe) {
+            gst_object_unref (probe);
+        }
+    }
+
     aac = check_plugin_feature (avdec_aac);
     alac = check_plugin_feature (avdec_alac);
 
@@ -162,6 +190,9 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         g_string_append (launch, "audioconvert ! ");
         g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */
         g_string_append (launch, "volume name=volume ! ");
+        /* everything up to here is codec-correct and always parses; the fallback
+           below rewinds to this point rather than re-inventing a chain (see it). */
+        gsize decoded_prefix = launch->len;
 
         if (!audio_rtp) {
             /* Normal path: local audio output */
@@ -196,7 +227,26 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         }
         renderer_type[i]->pipeline  = gst_parse_launch(launch->str, &error);
 	if (error) {
-          g_error ("gst_parse_launch error (audio %d):\n %s\n", i+1, error->message);
+          /* was g_error(), which is G_LOG_LEVEL_ERROR = ALWAYS fatal: in library
+             mode that abort()ed the host tray process.  Degrade to a silent
+             pipeline instead -- audio is lost for this format, mirroring and the
+             app survive. */
+          logger_log(logger, LOGGER_ERR, "gst_parse_launch error (audio %d): %s", i+1, error->message);
+          g_clear_error (&error);
+          /* gst_parse_launch can hand back a partly built pipeline TOGETHER with
+             the error; overwriting it without unref leaked one per failed start. */
+          if (renderer_type[i]->pipeline) {
+              gst_object_unref (renderer_type[i]->pipeline);
+              renderer_type[i]->pipeline = NULL;
+          }
+          /* Keep the decoder chain and only swap the sink for a fakesink: dropping
+             the decoder too would leave appsrc pushing AAC/ALAC caps straight into
+             audioconvert, and the resulting not-negotiated goes to the audio bus
+             handler, which quits the main loop -- i.e. a bad audio option would
+             tear down the live mirroring session instead of just muting it. */
+          g_string_truncate (launch, decoded_prefix);
+          g_string_append (launch, "fakesink sync=false");
+          renderer_type[i]->pipeline = gst_parse_launch(launch->str, &error);
           g_clear_error (&error);
         }
 
@@ -234,8 +284,10 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         g_string_free(launch, TRUE);
         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
         gst_caps_unref(caps);
-        g_object_unref(clock);
     }
+    /* one gst_system_clock_obtain() above => exactly one unref, and outside the
+       loop: it used to drop NFORMATS refs on the process-wide singleton clock. */
+    g_object_unref(clock);
 }
 
 void audio_renderer_stop() {

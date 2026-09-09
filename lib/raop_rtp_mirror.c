@@ -608,16 +608,26 @@ raop_rtp_mirror_thread(void *arg)
                 }
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror: unidentified extra header data  %f, %f", unknown_w, unknown_h);
 
-                /* Emit the final display dimensions at INFO so an embedding host can
-                 * read them (for window aspect-fit) without enabling debug logging. */
-                logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
-                           "display dimensions: w=%d h=%d", (int) width, (int) height);
+                /* PATCH (rotation direction probe): dump full 128-byte codec packet header at INFO
+                 * level so we can diff bytes between landscape-left and landscape-right captures.
+                 * Apple must encode the rotation direction somewhere in here, just need to find it. */
+                {
+                    char hex[3 * 128 + 1] = {0};
+                    int hp = 0;
+                    for (int b = 0; b < 128; b++) {
+                        hp += snprintf(hex + hp, sizeof(hex) - hp, "%02x ", packet[b]);
+                    }
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                               "ROTATION-PROBE type=1 codec packet header (128 bytes):\n%s", hex);
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                               "ROTATION-PROBE dims: w0=%.0f h0=%.0f ws=%.0f hs=%.0f uw=%.0f uh=%.0f w=%.0f h=%.0f  packet[6]=0x%02x",
+                               width_0, height_0, width_source, height_source, unknown_w, unknown_h, width, height, packet[6]);
+                }
                 if (raop_rtp_mirror->callbacks.video_report_size) {
-                    /* packet[5] is the upper byte of the masked-off payload_type short;
-                     * the iPhone uses it to encode orientation, so pass it on as a
-                     * rotation hint:
+                    /* PATCH: pass packet[5] (the upper byte of the masked-off payload_type short)
+                     * as a rotation hint -- iPhone uses it to encode orientation:
                      *   0x00 = portrait, 0x04 = landscape-right, 0x07 = landscape-left
-                     * 0x05/0x06 are treated as upside-down variants. */
+                     * 0x05/0x06 probably encode upside-down variants (TBD). */
                     int rotation_hint = (int) packet[5];
                     raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, &width_source, &height_source, &width, &height, rotation_hint);
                 }

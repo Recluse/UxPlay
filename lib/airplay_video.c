@@ -25,6 +25,7 @@
 
 #include "raop.h"
 #include "airplay_video.h"
+#include "netutils.h"
 
 typedef enum playlist_type_e {
     NONE,
@@ -66,7 +67,7 @@ struct airplay_video_s {
 
 //  initialize airplay_video service.
 airplay_video_t *airplay_video_init(raop_t *raop, unsigned short http_port, const char *lang) {
-    char uri[] = "http://localhost:";
+    char uri[32];   /* "http://" + dotted quad + ":" ; "localhost" when unpinned */
     char port[6] = { '\0' };
     assert(raop);
 
@@ -81,6 +82,10 @@ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short http_port, cons
     airplay_video->lang = lang;
      /* create local_uri_prefix string */
     snprintf(port, sizeof(port), "%u", http_port);
+    /* GStreamer's HLS client fetches these URIs from our own httpd; under -bind
+       that httpd no longer listens on loopback, so aim them at the pinned
+       address.  netutils_get_bind_host() is "localhost" when -bind is unused. */
+    snprintf(uri, sizeof(uri), "http://%s:", netutils_get_bind_host());
     size_t len = strlen(uri) + strlen(port);
     airplay_video->local_uri_prefix = (char *) calloc (len + 1, sizeof(char));
     strcat(airplay_video->local_uri_prefix, uri);

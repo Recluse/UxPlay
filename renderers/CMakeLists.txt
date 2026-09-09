@@ -83,16 +83,21 @@ else()
 endif()
 
 if( APPLE )
-  # The macOS overlay/layer bind in video_renderer.c calls objc_msgSend /
-  # sel_registerName (NSView setWantsLayer:/setLayer:) and CoreGraphics (CGColor
-  # for the CALayer background), so the renderers lib -- and anything linking it
-  # (uxplay-core.dylib) -- needs libobjc + the CoreGraphics framework.
+  # PATCH (Plan B / M3): the macOS overlay/layer bind in video_renderer.c calls
+  # objc_msgSend / sel_registerName (NSView setWantsLayer:/setLayer:) and CoreGraphics
+  # (CGColor for the CALayer background), so the renderers lib -- and anything linking
+  # it (uxplay-core.dylib) -- needs libobjc + the CoreGraphics framework.
   #
-  # The custom video sink avsample_sink.m (our own AVSampleBufferDisplayLayer,
-  # fed NV12 from an appsink) is Objective-C and needs the
-  # AV/CoreMedia/CoreVideo/QuartzCore + AppKit frameworks.
+  # PATCH (Plan B): the custom video sink avsample_sink.m (our own
+  # AVSampleBufferDisplayLayer, fed NV12 from an appsink) is Objective-C and needs
+  # the AV/CoreMedia/CoreVideo/QuartzCore + AppKit frameworks.
   enable_language( OBJC )
   target_sources( renderers PRIVATE avsample_sink.m )
+  # avsample_sink.m is written for ARC (bridge casts transfer ownership, no manual
+  # retain/release anywhere).  Compiled MRC, CFBridgingRetain adds a plain CFRetain
+  # and CFBridgingRelease only autoreleases it again, so the layer's original
+  # +1 from [alloc init] is never given back and every session leaks a layer.
+  set_source_files_properties( avsample_sink.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc" )
   target_link_libraries( renderers PUBLIC objc
                          "-framework CoreGraphics"
                          "-framework Foundation"
