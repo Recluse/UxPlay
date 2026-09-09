@@ -2165,16 +2165,23 @@ static int register_dnssd() {
      * DllMain fixed the timing but not the channel; this is the channel.
      *
      * Optional by construction, so an older shim (or Apple's) is not an error.
-     * Once per process: register_dnssd runs once per engine start, and the tray
-     * restarts the engine on every settings change. */
-    static bool dnssd_dll_identified = false;
-    if (!dnssd_dll_identified) {
-        dnssd_dll_identified = true;
+     *
+     * Deliberately NOT guarded to once per process. The first attempt was, and
+     * the line never appeared on Windows even though this block was compiled in
+     * and register_dnssd() demonstrably ran — and a one-shot static is exactly
+     * the thing that cannot be told apart from "did not execute", because any
+     * earlier call that bailed at the raop registration below would have eaten
+     * the flag without logging anything. register_dnssd() runs once per engine
+     * start, so unguarded costs one line per start and is always true. */
+    {
         HMODULE dll = GetModuleHandleA("dnssd.dll");   /* already loaded by dnssd_init */
         typedef const char * (__stdcall *shim_version_t)(void);
         shim_version_t shim_version = dll
             ? (shim_version_t) GetProcAddress(dll, "PopyachsaShimVersion") : NULL;
-        LOGI("dnssd.dll: %s", shim_version ? shim_version()
+        /* Called out here, not inside the varargs: a bad return would otherwise
+           take vsnprintf down inside log() with the format half-written. */
+        const char *version = shim_version ? shim_version() : NULL;
+        LOGI("dnssd.dll: %s", version ? version
              : "no PopyachsaShimVersion export — Apple Bonjour, or a shim older than 1.1.0");
     }
 #endif
