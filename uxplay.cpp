@@ -1958,10 +1958,17 @@ static int parse_arguments (int argc, char *argv[]) {
             hls_support = true;
             if (i < argc - 1 && *argv[i+1] != '-') {
                 unsigned int n = 3;
-                /* PATCH (Plan B): this tested playbin_version (still the default 3
-                   here) instead of the value just parsed, so "-hls 4" was accepted
-                   and reached video_renderer_init's g_assert(0) -- an abort that
-                   takes the whole host app down, from a typo in Settings. */
+                /* PATCH (Plan B): the value that gets through here is "-hls 1",
+                   NOT "-hls 4" as an earlier version of this comment claimed --
+                   measured against upstream, which rejects 4 and accepts 1.
+                   get_value() treats the initial *n as a MAXIMUM, so 0 and >3 are
+                   already refused; and the old second test, `playbin_version < 2`,
+                   can never fire because playbin_version is still its default
+                   here. So 1 is stored, and video_renderer_init's playbin switch
+                   has no case 1: g_assert(0), which aborts the whole host app --
+                   not at startup, where uri is NULL, but the first time someone
+                   casts a video. `n > 3` below is redundant with get_value and
+                   kept only so the accepted range reads at a glance. */
                 if (!get_value(argv[++i], &n) || n < 2 || n > 3) {
                     fprintf(stderr, "invalid \"-hls %s\"; -hls n only allows \"playbin\" video player versions 2 or 3\n", argv[i]);
                     PARSE_BAIL(1);
