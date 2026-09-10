@@ -111,7 +111,7 @@ static int type_jpeg = 0;
 typedef enum {
   //GST_PLAY_FLAG_VIDEO         = (1 << 0),
   //GST_PLAY_FLAG_AUDIO         = (1 << 1),
-  //GST_PLAY_FLAG_TEXT          = (1 << 2),
+  GST_PLAY_FLAG_TEXT          = (1 << 2),
   //GST_PLAY_FLAG_VIS           = (1 << 3),
   //GST_PLAY_FLAG_SOFT_VOLUME   = (1 << 4),
   //GST_PLAY_FLAG_NATIVE_AUDIO  = (1 << 5),
@@ -411,30 +411,89 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             g_assert(renderer_type[i]->pipeline);
             renderer_type[i]->codec = hls;
             /* if we are not using an autovideosink, build a videosink based on the string "videosink" */
-            if (!auto_videosink) { 
-                GstElement *playbin_videosink = make_video_sink(videosink, videosink_options);  
+            if (!auto_videosink) {
+#ifdef __APPLE__
+            /* PATCH (Plan B / macOS): "avlayer" is NOT a registered GStreamer element
+             * -- it is this fork's appsink -> AVSampleBufferDisplayLayer path, and it
+             * was only ever wired into the MIRROR pipeline below.  Here
+             * gst_element_factory_make("avlayer") returns NULL -- nothing in this
+             * fork ever calls gst_element_register(), and no bundled plugin provides
+             * that factory -- so playbin logged "failed to create
+             * playbin_videosink" and fell back to its own
+             * autovideosink, whose only candidate in this bundle is
+             * avsamplebufferlayersink -- the framework sink this fork abandoned for
+             * the UAF on caps-change, and one that renders into a layer of its own
+             * rather than the host NSView.  Give playbin the same appsink bin the
+             * mirror pipeline uses and bind it to the host NSView.
+             * sync=true (NOT the mirror's sync=false): HLS is a timestamped VOD
+             * stream, so the sink -- not the arrival rate -- is the clock. */
+            if (!strcmp(videosink, "avlayer")) {
+                GError *berr = NULL;
+                void *hostview = airplay_get_host_window();
+                GstElement *sinkbin = gst_parse_bin_from_description(
+                    "videoconvert ! video/x-raw,format=NV12 ! appsink name=avlayer_hls"
+                    " emit-signals=false sync=true max-buffers=3 drop=true", TRUE, &berr);
+                GstElement *asink = sinkbin ?
+                    gst_bin_get_by_name(GST_BIN(sinkbin), "avlayer_hls") : NULL;
+                if (!hostview || !asink) {
+                    logger_log(logger, LOGGER_ERR,
+                               "video_renderer_init: no hls avlayer sink (%s) -- playbin picks its own",
+                               berr ? berr->message : (hostview ? "appsink missing" : "no host window"));
+                    if (sinkbin) gst_object_unref(sinkbin);
+                } else {
+                    renderer_type[i]->avlayer = avlayer_sink_create(hostview);
+                    GstAppSinkCallbacks cbs;
+                    memset(&cbs, 0, sizeof(cbs));
+                    cbs.new_sample = avlayer_on_new_sample;
+                    gst_app_sink_set_callbacks(GST_APP_SINK(asink), &cbs,
+                                               renderer_type[i]->avlayer, NULL);
+                    g_object_set(G_OBJECT (renderer_type[i]->pipeline), "video-sink", sinkbin, NULL);
+                    logger_log(logger, LOGGER_INFO,
+                               "avlayer: bound hls playbin appsink to host NSView %p%s", hostview,
+                               renderer_type[i]->avlayer ? "" : " (LAYER CREATE FAILED)");
+                }
+                if (asink) gst_object_unref(asink);
+                g_clear_error(&berr);
+            } else
+#endif
+              {
+                GstElement *playbin_videosink = make_video_sink(videosink, videosink_options);
                 if (!playbin_videosink) {
                     logger_log(logger, LOGGER_ERR, "video_renderer_init: failed to create playbin_videosink");
                 } else {
                     logger_log(logger, LOGGER_DEBUG, "video_renderer_init: create playbin_videosink at %p", playbin_videosink);
                     g_object_set(G_OBJECT (renderer_type[i]->pipeline), "video-sink", playbin_videosink, NULL);
                 }
+              }
             }
             gint flags = 0;
             g_object_get(renderer_type[i]->pipeline, "flags", &flags, NULL);
-            /* PATCH (media-mode lag-reduction): for AirPlay HLS, source is iPhone in LAN.
-             * Disable DOWNLOAD (no disk cache, adds IO latency) and BUFFERING (preroll wait).
-             * Combined with buffer-duration=0, buffer-size=0, this minimizes startup latency
-             * and live-edge delay. */
+            /* PATCH (media-mode lag-reduction), CORRECTED.  It used to also clear
+             * BUFFERING and set buffer-duration/size to 0, on the stated grounds
+             * that "source is iPhone in LAN" -- which is true of MIRRORING and
+             * false of exactly the path this branch is.  In the AirPlay video
+             * protocol the phone hands over a URL and GStreamer fetches the
+             * segments from the sender's CDN over the internet; there is no
+             * preroll reserve to give away.  Measured on Windows with a real
+             * iPhone: with buffering off the picture froze on its first frame
+             * while the phone's clock ran on; with buffering restored it played,
+             * and the owner's remaining complaint was a slow START -- the cost of
+             * having no reserve.  DOWNLOAD stays off (an on-disk cache buys a
+             * receiver nothing), buffering goes back to the default. */
             flags &= ~GST_PLAY_FLAG_DOWNLOAD;
-            flags &= ~GST_PLAY_FLAG_BUFFERING;
+            /* PATCH (macOS bundle): TEXT off.  A receiver has no subtitle UI, but
+             * playbin still opens a text branch for any WebVTT rendition a master
+             * playlist advertises -- and with no webvttdec/timed-text decoder it
+             * sits at "buffering 0%" FOREVER, logging only a "Missing element"
+             * WARNING.  That is a silent hang indistinguishable from the missing
+             * plugins this same release fixes.  Measured: identical stream +
+             * identical bundle, TEXT set -> never prerolls; TEXT clear -> plays.
+             * Clearing it also keeps subparse/pango (+13 MB of font stack) out of
+             * the bundle. */
+            flags &= ~GST_PLAY_FLAG_TEXT;
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
-            g_object_set(renderer_type[i]->pipeline,
-                         "buffer-duration", (gint64) 0,
-                         "buffer-size",     (gint)  0,
-                         NULL);
             logger_log(logger, LOGGER_INFO,
-                       "playbin%u configured for low-latency HLS: flags=0x%x buffer-duration=0 buffer-size=0",
+                       "playbin%u configured for HLS: flags=0x%x (buffering left at the default)",
                        playbin_version, flags);
             //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
         } else {
@@ -1300,7 +1359,17 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
             if (new_state != GST_STATE_PLAYING) {
                 hls_playing = FALSE;
                 break;
-            } 
+            }
+            if (!hls_playing) {
+                /* PATCH (Plan B / macOS host): the host shows + fits its mirror
+                 * window on the "Begin streaming" marker, which video_renderer_render_buffer()
+                 * emits on the first MIRROR packet -- a code path the HLS video
+                 * protocol never touches, so the picture landed in a window that
+                 * was still hidden.  playbin reaching PLAYING is the HLS equivalent
+                 * of that first packet.  (No wxh line: playbin knows the size, the
+                 * layer letterboxes into whatever window size the host chose.) */
+                logger_log(logger, LOGGER_INFO, "Begin streaming HLS video to GStreamer playbin");
+            }
             hls_playing = TRUE;
             GstQuery *query = NULL;
             query = gst_query_new_seeking(GST_FORMAT_TIME);
