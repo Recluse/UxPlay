@@ -489,7 +489,13 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              * plugins this same release fixes.  Measured: identical stream +
              * identical bundle, TEXT set -> never prerolls; TEXT clear -> plays.
              * Clearing it also keeps subparse/pango (+13 MB of font stack) out of
-             * the bundle. */
+             * the bundle.
+             * Measured on macOS only.  On Windows (2026-09-10, four runs with a
+             * real iPhone) the bundle HAS subparse: YouTube's caption rendition
+             * (DEFAULT=NO,AUTOSELECT=YES) is auto-selected by decodebin3 whether
+             * or not CC is on at the phone, and it renders -- so there this line
+             * removes working subtitles.  Kept unconditional until the Linux
+             * bundle is checked for subparse; see BACKLOG "TEXT off". */
             flags &= ~GST_PLAY_FLAG_TEXT;
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
             logger_log(logger, LOGGER_INFO,

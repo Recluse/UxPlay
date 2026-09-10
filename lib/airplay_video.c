@@ -905,11 +905,24 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
            playlist served to the player carries heap garbage after
            #EXT-X-ENDLIST -- (prefix_len - 2) bytes per chunk, which for a
            ~1000-chunk YouTube VOD is kilobytes of it.
-       `assert(byte_count == new_len)` below was supposed to catch this and never
-       could: every shipped build is -DNDEBUG, so the assert is compiled out.
+       `assert(byte_count == new_len)` below was supposed to catch this; it is
+       compiled out of Release builds (-DNDEBUG: the macOS bundle) and live in
+       the Windows/Linux builds, which set no build type.
        Over-allocate by prefix_len instead of computing exactly (a subtraction on
        size_t underflows if a future format has a longer prefix than the rest),
-       and terminate at what was actually written. */
+       and terminate at what was actually written.
+
+       CORRECTION (2026-09-10): this fix did NOT make AirPlay video play, as its
+       commit message claimed.  YouTube sends PREFIX="s/" (prefix_len 2), for
+       which the old size is exact.  Measured on Windows with a real iPhone,
+       cores differing in exactly this hunk, two clips each: byte-identical
+       outcomes -- both play, both with subtitles.  What made Windows play was
+       bundling the GIO TLS backend (removing lib/gio/modules/ alone reproduces
+       the failure, "Couldn't download fragments"); what made macOS play was
+       bundling the HLS plugins and TEXT off (see video_renderer.c).  This hunk
+       is correct for prefix_len != 2 and a no-op on real traffic.  Upstream
+       rewrote the function with the exact formula (575c562); drop this hunk on
+       rebase. */
     new_len += count * (base_uri_len + params_len + 2);
 
     int byte_count = 0;
@@ -989,7 +1002,9 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
 
     /* Terminate where the content ENDS, not at the end of the allocation. */
     *new_pos = '\0';
-    assert(byte_count == (int) (new_pos - new_playlist));
+    /* The first term alone is a tautology (both count the same writes); the
+       second is the one that catches a short buffer. */
+    assert(byte_count == (int) (new_pos - new_playlist) && byte_count <= (int) new_len);
 
     free (prefix);
     free (base_uri);
