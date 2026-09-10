@@ -892,7 +892,25 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
 
     size_t old_size = strlen(media_playlist);
     size_t new_len = old_size;
-    new_len += count * (base_uri_len + params_len);
+    /* PATCH (Plan B): was `count * (base_uri_len + params_len)`, which is short by
+       (prefix_len - 2) FOR EVERY CHUNK.  Each chunk writes two '/' separators per
+       parameter while the comma between parameters is not copied, so the real
+       growth is base_uri_len + params_len + 2 - prefix_len.  Two consequences,
+       both measured:
+         * prefix_len < 2  -> the buffer is too small and the expansion writes
+           past it; ASan reports a heap-buffer-overflow.
+         * prefix_len > 2  -> the buffer is LONGER than what is written, and the
+           bytes between are uninitialised malloc memory.  http_handlers.h sets
+           the HTTP response length with strlen() on this buffer, so a media
+           playlist served to the player carries heap garbage after
+           #EXT-X-ENDLIST -- (prefix_len - 2) bytes per chunk, which for a
+           ~1000-chunk YouTube VOD is kilobytes of it.
+       `assert(byte_count == new_len)` below was supposed to catch this and never
+       could: every shipped build is -DNDEBUG, so the assert is compiled out.
+       Over-allocate by prefix_len instead of computing exactly (a subtraction on
+       size_t underflows if a future format has a longer prefix than the rest),
+       and terminate at what was actually written. */
+    new_len += count * (base_uri_len + params_len + 2);
 
     int byte_count = 0;
     char * new_playlist = (char *) malloc(new_len + 1);
@@ -900,7 +918,6 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
         printf("Memory allocation failure (new_playlist)\n");
         exit(1);
     }
-    new_playlist[new_len] = '\0';
     const char *old_pos = media_playlist;
     char *new_pos = new_playlist;
     ptr = old_pos;
@@ -970,7 +987,9 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
     new_pos += len;
     old_pos += len;
 
-    assert(byte_count == (int) new_len);
+    /* Terminate where the content ENDS, not at the end of the allocation. */
+    *new_pos = '\0';
+    assert(byte_count == (int) (new_pos - new_playlist));
 
     free (prefix);
     free (base_uri);
