@@ -468,39 +468,42 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             }
             gint flags = 0;
             g_object_get(renderer_type[i]->pipeline, "flags", &flags, NULL);
-            /* PATCH (media-mode lag-reduction), CORRECTED.  It used to also clear
-             * BUFFERING and set buffer-duration/size to 0, on the stated grounds
-             * that "source is iPhone in LAN" -- which is true of MIRRORING and
-             * false of exactly the path this branch is.  In the AirPlay video
-             * protocol the phone hands over a URL and GStreamer fetches the
-             * segments from the sender's CDN over the internet; there is no
-             * preroll reserve to give away.  Measured on Windows with a real
-             * iPhone: with buffering off the picture froze on its first frame
-             * while the phone's clock ran on; with buffering restored it played,
-             * and the owner's remaining complaint was a slow START -- the cost of
-             * having no reserve.  DOWNLOAD stays off (an on-disk cache buys a
-             * receiver nothing), buffering goes back to the default. */
-            flags &= ~GST_PLAY_FLAG_DOWNLOAD;
-            /* PATCH (macOS bundle): TEXT off.  A receiver has no subtitle UI, but
-             * playbin still opens a text branch for any WebVTT rendition a master
-             * playlist advertises -- and with no webvttdec/timed-text decoder it
-             * sits at "buffering 0%" FOREVER, logging only a "Missing element"
-             * WARNING.  That is a silent hang indistinguishable from the missing
-             * plugins this same release fixes.  Measured: identical stream +
-             * identical bundle, TEXT set -> never prerolls; TEXT clear -> plays.
-             * Clearing it also keeps subparse/pango (+13 MB of font stack) out of
-             * the bundle.
-             * Measured on macOS only.  On Windows (2026-09-10, four runs with a
-             * real iPhone) the bundle HAS subparse: YouTube's caption rendition
-             * (DEFAULT=NO,AUTOSELECT=YES) is auto-selected by decodebin3 whether
-             * or not CC is on at the phone, and it renders -- so there this line
-             * removes working subtitles.  Kept unconditional until the Linux
-             * bundle is checked for subparse; see BACKLOG "TEXT off". */
+            flags &= ~GST_PLAY_FLAG_DOWNLOAD;   /* an on-disk cache buys a receiver nothing */
+#ifdef __APPLE__
+            /* PATCH (macOS): default BUFFERING and TEXT off.  Both were measured on
+             * the macOS bundle only and, until 0783c70, applied to every platform;
+             * on Windows that turned a 4/4 playing configuration into black windows
+             * and freezes (2026-09-11, real iPhone), so they are Apple-only now.
+             *   BUFFERING: with the pre-f700f24 zero-buffer settings the macOS
+             *   picture froze on its first frame while the phone's clock ran on;
+             *   the default preroll reserve played.  On Windows the opposite was
+             *   measured: default buffering sat below 100% and never reached
+             *   PLAYING, zero-buffer played.  Whether the difference is the sink
+             *   (AVSampleBufferDisplayLayer vs d3d11) or the CDN of the day is not
+             *   settled; each platform keeps what it was seen playing with.
+             *   TEXT: the macOS bundle has no timed-text decoder, so a selected
+             *   WebVTT rendition sits at "buffering 0%" forever with only a
+             *   "Missing element" WARNING.  Windows and Linux ship subparse and
+             *   render the captions; there TEXT stays on. */
             flags &= ~GST_PLAY_FLAG_TEXT;
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
             logger_log(logger, LOGGER_INFO,
                        "playbin%u configured for HLS: flags=0x%x (buffering left at the default)",
                        playbin_version, flags);
+#else
+            /* PATCH (media-mode lag-reduction): no preroll reserve -- the settings
+             * the Windows 2x2 re-test played 4/4 with (2026-09-10); see above for
+             * why this is not applied on macOS. */
+            flags &= ~GST_PLAY_FLAG_BUFFERING;
+            g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
+            g_object_set(renderer_type[i]->pipeline,
+                         "buffer-duration", (gint64) 0,
+                         "buffer-size",     (gint)  0,
+                         NULL);
+            logger_log(logger, LOGGER_INFO,
+                       "playbin%u configured for low-latency HLS: flags=0x%x buffer-duration=0 buffer-size=0",
+                       playbin_version, flags);
+#endif
             //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
         } else {
             bool jpeg_pipeline = false;
@@ -1366,6 +1369,7 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
                 hls_playing = FALSE;
                 break;
             }
+#ifdef __APPLE__
             if (!hls_playing) {
                 /* PATCH (Plan B / macOS host): the host shows + fits its mirror
                  * window on the "Begin streaming" marker, which video_renderer_render_buffer()
@@ -1373,9 +1377,15 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
                  * protocol never touches, so the picture landed in a window that
                  * was still hidden.  playbin reaching PLAYING is the HLS equivalent
                  * of that first packet.  (No wxh line: playbin knows the size, the
-                 * layer letterboxes into whatever window size the host chose.) */
+                 * layer letterboxes into whatever window size the host chose.)
+                 * Apple-only: the HLS sink is bound into the host view only under
+                 * __APPLE__ (video_renderer_init).  Elsewhere playbin renders into
+                 * the sink's own window, and this marker made the Windows and Linux
+                 * hosts raise an EMPTY fullscreen window over it (0.2.14 Linux,
+                 * Windows re-test 2026-09-11). */
                 logger_log(logger, LOGGER_INFO, "Begin streaming HLS video to GStreamer playbin");
             }
+#endif
             hls_playing = TRUE;
             GstQuery *query = NULL;
             query = gst_query_new_seeking(GST_FORMAT_TIME);
